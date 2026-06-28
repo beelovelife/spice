@@ -22,7 +22,6 @@ WELCOME_QUOTES: list[WelcomeQuote] = [
     ("Deep truths arrive quietly.", "深处的真相总是静静抵达。"),
     ("A beginning is the time for taking the most delicate care.", "万事开头时，最需精心呵护。"),
     ("Survival is the ability to swim in strange water.", "生存，就是在陌生水域中游泳的能力。"),
-    ("Plans within plans within plans.", "计中计中计。"),
     ("The people who can destroy a thing, they control it.", "能毁灭某物的人，才是真正控制它的人。"),
     ("Without change, something sleeps inside us, and seldom awakens.", "没有变化，内心某些东西便沉睡不醒。"),
     ("This is only the beginning.", "这仅仅是个开始。"),
