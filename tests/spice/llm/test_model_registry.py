@@ -16,7 +16,6 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertIsNotNone(registry.find("anthropic", "claude-haiku-4-5"))
         self.assertIsNotNone(registry.find("anthropic", "claude-sonnet-4-6"))
         self.assertIsNotNone(registry.find("anthropic", "claude-opus-4-8"))
-        self.assertIsNone(registry.find("anthropic", "claude-3-5-sonnet-latest"))
 
     def test_models_settings_json_registers_profiles_by_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

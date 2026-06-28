@@ -269,19 +269,6 @@ uv run spice --debug
 
 ---
 
-## 📍 路线与现状
-
-详细路线见仓库根目录的 [`AGENTS.md`](AGENTS.md) 与 [`PLAN.md`](PLAN.md)。
-
-近期重点：
-
-- 收紧 CLI / TUI 主链路，命令、补全、选择列表、事件流统一从 registry 流出
-- 完善 provider 转换层与模型诊断（`spice models` / `spice doctor`）
-- 上下文管理：手动 + 自动 compaction、focus、可序列化上下文
-- 能力扩展：长期记忆、long task、subagent、skill/extension 生态
-
----
-
 ## 📄 许可证
 
 本项目基于 [Apache License 2.0](LICENSE) 开源。
