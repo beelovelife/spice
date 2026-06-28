@@ -1,5 +1,7 @@
 # Spice
 
+[官网](https://spiceagent.vercel.app/) · [GitHub](https://github.com/beelovelife/spice)
+
 > 一个使用 Python 构建的本地 coding agent，提供 CLI / TUI 两种交互形态，支持多 LLM provider、可扩展工具体系、会话持久化、上下文压缩、技能（skills）与本地扩展（extensions）。
 
 Spice 强调架构边界清晰、运行链路可追踪、会话可恢复、工具受控。整体心态是「核心稳、能力放边缘」：默认尽量从 CLI 命令、skill、扩展、配置项接入新能力，避免把 agent loop 写成万能大文件。
@@ -8,11 +10,12 @@ Spice 强调架构边界清晰、运行链路可追踪、会话可恢复、工�
 
 ## ✨ 主要特性
 
-- **多 provider 支持**：内置 OpenAI、DeepSeek、Anthropic、Gemini 等模型，统一通过模型注册表与 `~/.spice/settings.json` 管理。
+- **多 provider 支持**：内置 OpenAI、DeepSeek、Anthropic、Gemini 等模型，包括 Claude Haiku 4.5、Sonnet 4.6 与 Opus 4.8，统一通过模型注册表与 `~/.spice/settings.json` 管理。
 - **双前端体验**：`spice` / `spice chat` 走基于 `prompt_toolkit` 的交互式 CLI，`spice tui` 进入全屏 TUI；二者复用同一套 agent / session / 命令 / 补全语义。
 - **流式 agent loop**：明确的 `prompt → turn_start → assistant stream → tool calls → tool results → turn_end → agent_end` 事件流，UI、会话持久化、trace 都挂在事件上。
 - **受控工具体系**：内置 `file`、`bash`、`web`、`skill`、`memory`、`subagent` 等工具集合，统一 schema / 执行 / 错误结构，支持 read-only 模式与确认门。
-- **会话持久化与树状分支**：JSONL 存储，支持 `resume`、`rewind`、`fork`、`prune`、`workspaces` 等管理命令。
+- **会话持久化与树状分支**：默认使用可读的 JSONL 文件，也可切换 SQLite；支持 `resume`、`rewind`、`fork`、`prune`、`workspaces` 等管理命令。
+- **受控执行环境**：默认在本机 workspace 策略下执行，也可使用 Docker sandbox 隔离命令运行。
 - **上下文压缩**：手动 `/compact` 与自动 compaction，配合可序列化上下文与摘要原因。
 - **Skills 与 Extensions**：`~/.spice/skills/` 沉淀工作流，`~/.spice/extensions/*.py` 提供可信本地扩展，能注册工具、slash command 与 hook。
 - **长任务与子代理**：内置 long task 状态机和 `spawn_subagents` 工具，可在主 agent 中分发子任务。
@@ -22,36 +25,63 @@ Spice 强调架构边界清晰、运行链路可追踪、会话可恢复、工�
 
 ## 🚀 快速开始
 
-### 环境要求
+### 1. 环境要求
 
 - Python `>= 3.11`
-- [`uv`](https://github.com/astral-sh/uv) 做依赖与虚拟环境管理（推荐）
+- [`uv`](https://docs.astral.sh/uv/) 管理安装、依赖与虚拟环境
+- Git（从 GitHub 安装或参与开发时需要）
 - macOS / Linux（Windows 未做覆盖测试）
 
-### 安装与运行
-
 ```bash
-git clone <repo-url> spice
-cd spice
-
-# 使用 uv 同步依赖（首次会创建 .venv 并写入 lockfile）
-uv sync
-
-# 进入交互式 CLI（默认入口）
-uv run spice
-
-# 或者通过显式子命令
-uv run spice chat                  # 交互式 CLI
-uv run spice tui                   # 全屏 TUI
-uv run spice run "你好，介绍一下自己"  # 单次 prompt
-uv run spice --version             # 查看版本
+uv --version
+python3 --version
 ```
 
-新增依赖请使用 `uv add <package>`，避免手动改 lockfile。
+尚未安装 uv 时：
 
-### 配置 API Key
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-Spice 优先从环境变量读取 API key，未命中时回落到 `~/.spice/secrets.json`：
+### 2. 安装 Spice
+
+推荐安装为隔离的全局工具，之后可以在任意工作目录直接运行 `spice`：
+
+```bash
+uv tool install git+https://github.com/beelovelife/spice.git
+spice --version
+```
+
+需要查看或修改源码时：
+
+```bash
+git clone https://github.com/beelovelife/spice.git
+cd spice
+uv sync
+source .venv/bin/activate
+spice --version
+```
+
+### 3. 配置 API Key
+
+首次使用可先配置 OpenAI 或 DeepSeek。Spice 优先读取环境变量，未命中时读取 `~/.spice/secrets.json`：
+
+```bash
+export OPENAI_API_KEY="sk-..."
+# 或
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+也可以创建私有密钥文件：
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "DEEPSEEK_API_KEY": "sk-..."
+}
+```
+
+支持的密钥如下：
 
 | Provider  | 环境变量                                  |
 |-----------|-------------------------------------------|
@@ -60,17 +90,17 @@ Spice 优先从环境变量读取 API key，未命中时回落到 `~/.spice/secr
 | anthropic | `ANTHROPIC_API_KEY`                       |
 | gemini    | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`      |
 | tavily    | `TAVILY_API_KEY`                          |
-| brave     | `BRAVE_SEARCH_API_KEY`                    |
 
-也可以通过 CLI 写入：
+### 4. 选择模型
+
+进入交互式 CLI 后运行 `/models`，或通过命令设置默认模型：
 
 ```bash
-uv run spice                    # 进入交互式 CLI 后运行 /models 选择模型
-uv run spice config set default-model gpt-5.1
-uv run spice config set api-key sk-xxxxxxxx          # 写入 ~/.spice/secrets.json
+spice models
+spice config set default-model gpt-5.1
 ```
 
-更复杂的模型配置直接编辑 `~/.spice/settings.json`。`defaultModel` 指向 `models` 里的 profile key；API key 不写入这里，继续使用环境变量或 `~/.spice/secrets.json`：
+也可以在 `~/.spice/settings.json` 中定义 profile。API key 不应写入该文件：
 
 ```json
 {
@@ -82,16 +112,25 @@ uv run spice config set api-key sk-xxxxxxxx          # 写入 ~/.spice/secrets.j
       "baseUrl": "https://api.deepseek.com",
       "protocol": "openai-completions",
       "temperature": 0.2
-    },
-    "deepseek-v4-flash": {
-      "provider": "deepseek",
-      "model": "deepseek-v4-flash",
-      "baseUrl": "https://api.deepseek.com",
-      "protocol": "openai-completions",
-      "temperature": 0.2
     }
   }
 }
+```
+
+### 5. 运行
+
+```bash
+spice                           # 交互式 CLI
+spice tui                       # 全屏 TUI
+spice run "你好，介绍一下自己" # 单次 prompt
+```
+
+从未激活的源码环境运行时，在上述命令前加 `uv run`：
+
+```bash
+uv run spice
+uv run spice tui
+uv run spice run "你好，介绍一下自己"
 ```
 
 ---
@@ -131,7 +170,28 @@ uv run spice config set api-key sk-xxxxxxxx          # 写入 ~/.spice/secrets.j
 | `spice config show`                 | 打印当前配置和 settings/secrets 路径                |
 | `spice config path`                 | 仅打印配置文件路径                                  |
 | `spice config get <key>`            | 读取某个配置项                                      |
-| `spice config set <key> <value>`    | 设置：`default-model` / `api-key` / `debug.trace` / `memory.enabled` / `logging.retention_days` |
+| `spice config set <key> <value>`    | 设置模型、密钥、trace、memory、日志保留期或 storage |
+
+支持的配置键包括 `default-model`、`api-key`、`debug.trace`、`memory.enabled`、`logging.retention_days`、`storage.backend` 与 `storage.sqlitePath`。
+
+### Sandbox（`spice sandbox`）
+
+| 子命令                              | 说明                                                |
+|-------------------------------------|-----------------------------------------------------|
+| `spice sandbox status`              | 查看当前 workspace 的执行模式与后端状态             |
+| `spice sandbox init`                | 创建、启动并检查 Docker sandbox；本机模式直接 ready |
+| `spice sandbox exec "<command>"`    | 通过当前 sandbox 后端执行 shell 命令                 |
+| `spice sandbox stop`                | 停止 Docker 容器；workspace/local 模式不支持 stop   |
+
+### Storage（`spice storage`）
+
+默认使用 `~/.spice/sessions/` 下的 JSONL 文件。切换 SQLite 时：
+
+```bash
+spice config set storage.backend sqlite
+spice config set storage.sqlitePath ~/.spice/spice.db
+spice storage init
+```
 
 ### 技能（`spice skills`）
 
@@ -191,7 +251,7 @@ CLI 与 TUI 共享同一套 command registry，business logic 不在输入循环
 | `core`     | `get_current_time`                                                                            |
 | `file`     | `list_dir`、`read_file`、`read_files`、`write_file`、`edit_file`、`apply_patch`、`search_files` |
 | `bash`     | `bash`                                                                                        |
-| `web`      | `web_search`（依赖 Tavily / Brave）                                                           |
+| `web`      | `web_search`（依赖 Tavily）                                                                   |
 | `skill`    | `skills_list`、`skill_view`                                                                   |
 | `memory`   | `memory`                                                                                      |
 | `subagent` | `spawn_subagents`                                                                             |
@@ -255,7 +315,7 @@ tests/            行为与回归测试
 uv run pytest
 
 # 运行单个文件
-uv run pytest tests/test_agent_loop.py
+uv run pytest tests/spice/agent/test_loop.py
 
 # 调试模式下运行 CLI
 uv run spice --debug
