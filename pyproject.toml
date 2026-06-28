@@ -1,0 +1,35 @@
+[project]
+name = "spice"
+version = "0.1.0"
+description = "Add your description here"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.75.0",
+    "google-genai>=1.55.0",
+    "openai>=2.14.0",
+    "prompt-toolkit>=3.0.52",
+    "pydantic>=2.13.4",
+    "rich>=15.0.0",
+    "setproctitle>=1.3.7",
+    "tavily-python>=0.7.26",
+    "typer>=0.26.7",
+]
+
+[project.scripts]
+spice = "spice.cli.main:app"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["spice*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true

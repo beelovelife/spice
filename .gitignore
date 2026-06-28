@@ -1,0 +1,45 @@
+# Internal documents and local project material
+/docs/
+/design/
+/frontend/
+/.spice/
+/AGENTS.md
+/MEMORY.md
+/PLAN.md
+# Python environments
+/.venv/
+/.venv*/
+/venv/
+/env/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local databases, logs and tool output
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Frontend/generated files
+node_modules/
+*.tsbuildinfo
+
+# Editors and operating system
+.idea/
+.vscode/
+.DS_Store
