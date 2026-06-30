@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.key_binding import KeyBindings
@@ -35,7 +36,7 @@ from prompt_toolkit.layout import ConditionalContainer, Float, FloatContainer, H
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.layout.processors import BeforeInput, Processor, Transformation
+from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
@@ -205,20 +206,35 @@ def _render_plain_table(lines: list[str], *, width: int) -> str:
     return output.getvalue().rstrip()
 
 
-class _MessageBufferControl(BufferControl):
-    """BufferControl subclass with custom mouse-scroll for follow-tail management."""
+class _MessageBufferControl(FormattedTextControl):
+    """Read-only message control with explicit display-line wrapping."""
 
     def __init__(self, tui: "SpiceTUI", **kwargs):
-        super().__init__(**kwargs)
+        kwargs.pop("buffer", None)
+        kwargs.pop("input_processors", None)
+        kwargs.setdefault("focusable", False)
+        super().__init__(
+            text=tui._message_fragments,
+            show_cursor=False,
+            get_cursor_position=tui._message_cursor_position,
+            **kwargs,
+        )
         self._tui = tui
+
+    def create_content(self, width: int, height: int | None):
+        self._tui._message_display_width = width
+        if isinstance(height, int) and height > 0:
+            self._tui._message_display_height = height
+        self._tui._sync_message_scroll()
+        return super().create_content(width, height)
 
     def mouse_handler(self, mouse_event):
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
-            self._tui._scroll_messages(-3)
+            self._tui._scroll_active_view(-3)
             self._tui._app.invalidate()
             return None
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-            self._tui._scroll_messages(3)
+            self._tui._scroll_active_view(3)
             self._tui._app.invalidate()
             return None
         return super().mouse_handler(mouse_event)
@@ -233,25 +249,14 @@ class _InputBufferControl(BufferControl):
 
     def mouse_handler(self, mouse_event):
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
-            self._tui._scroll_messages(-3)
+            self._tui._scroll_active_view(-3)
             self._tui._app.invalidate()
             return None
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-            self._tui._scroll_messages(3)
+            self._tui._scroll_active_view(3)
             self._tui._app.invalidate()
             return None
         return super().mouse_handler(mouse_event)
-
-
-class _ThoughtLabelProcessor(Processor):
-    """Apply a softer style to transient thought-duration rows."""
-
-    def apply_transformation(self, transformation_input):
-        fragments = transformation_input.fragments
-        text = "".join(fragment[1] for fragment in fragments)
-        if text.strip().startswith("Thought for "):
-            return Transformation(fragments=[("class:thought-label", text)])
-        return Transformation(fragments=fragments)
 
 
 class SpiceTUI:
@@ -338,13 +343,13 @@ class SpiceTUI:
 
         @kb.add("pageup")
         def _page_up(event) -> None:
-            if self._move_model_choice(-1):
+            if self._move_model_choice(-self._selector_page_size()):
                 event.app.invalidate()
                 return
-            if self._move_session_choice(-1):
+            if self._move_session_choice(-self._selector_page_size(row_height=2)):
                 event.app.invalidate()
                 return
-            if self._move_rewind_choice(-1):
+            if self._move_rewind_choice(-self._selector_page_size()):
                 event.app.invalidate()
                 return
             if self._move_confirmation(-1):
@@ -355,13 +360,13 @@ class SpiceTUI:
 
         @kb.add("pagedown")
         def _page_down(event) -> None:
-            if self._move_model_choice(1):
+            if self._move_model_choice(self._selector_page_size()):
                 event.app.invalidate()
                 return
-            if self._move_session_choice(1):
+            if self._move_session_choice(self._selector_page_size(row_height=2)):
                 event.app.invalidate()
                 return
-            if self._move_rewind_choice(1):
+            if self._move_rewind_choice(self._selector_page_size()):
                 event.app.invalidate()
                 return
             if self._move_confirmation(1):
@@ -521,13 +526,10 @@ class SpiceTUI:
 
         self._message_control = _MessageBufferControl(
             self,
-            buffer=self._message_buffer,
-            focusable=False,
-            input_processors=[_ThoughtLabelProcessor()],
         )
         self._message_window = Window(
             content=self._message_control,
-            wrap_lines=True,
+            wrap_lines=False,
             always_hide_cursor=True,
             get_vertical_scroll=lambda _window: self._message_vertical_scroll,
             right_margins=[ScrollbarMargin(display_arrows=False)],
@@ -732,15 +734,8 @@ class SpiceTUI:
 
     def _set_message_text(self, text: str) -> None:
         """Replace buffer text and keep the message viewport in sync."""
-        if self._message_follow_tail or not text:
-            cursor_position = len(text)
-        else:
-            old_row = self._message_buffer.document.cursor_position_row
-            lines = self._message_lines(text)
-            new_row = max(0, min(len(lines) - 1, old_row))
-            cursor_position = Document(text).translate_row_col_to_index(new_row, 0)
         self._message_buffer.set_document(
-            Document(text, cursor_position=cursor_position),
+            Document(text, cursor_position=len(text)),
             bypass_readonly=True,
         )
         self._sync_message_scroll(text)
@@ -749,8 +744,47 @@ class SpiceTUI:
         value = self._message_buffer.text if text is None else text
         return value.split("\n") if value else [""]
 
+    def _message_display_lines(self, text: str | None = None) -> list[str]:
+        width = max(1, self._message_window_width() - 1)
+        display_lines: list[str] = []
+        for logical_line in self._message_lines(text):
+            if not logical_line:
+                display_lines.append("")
+                continue
+            current: list[str] = []
+            current_width = 0
+            for char in logical_line.expandtabs(4):
+                char_width = max(0, get_cwidth(char))
+                if current and char_width and current_width + char_width > width:
+                    display_lines.append("".join(current))
+                    current = []
+                    current_width = 0
+                current.append(char)
+                current_width += char_width
+            display_lines.append("".join(current))
+        return display_lines
+
+    def _message_fragments(self):
+        fragments = []
+        lines = self._message_display_lines()
+        for index, line in enumerate(lines):
+            style = "class:thought-label" if line.strip().startswith("Thought for ") else ""
+            suffix = "\n" if index < len(lines) - 1 else ""
+            fragments.append((style, line + suffix))
+        return fragments
+
+    def _message_cursor_position(self) -> Point:
+        last_row = max(0, len(self._message_display_lines()) - 1)
+        if self._message_follow_tail:
+            return Point(x=0, y=last_row)
+        height = getattr(self, "_message_display_height", None)
+        if not isinstance(height, int) or height <= 0:
+            height = self._message_window_height()
+        visible_bottom = self._message_vertical_scroll + max(1, height) - 1
+        return Point(x=0, y=min(last_row, visible_bottom))
+
     def _message_bottom_scroll(self, text: str | None = None) -> int:
-        lines = self._message_lines(text)
+        lines = self._message_display_lines(text)
         return max(0, len(lines) - self._message_window_height())
 
     def _sync_message_scroll(self, text: str | None = None) -> None:
@@ -760,15 +794,51 @@ class SpiceTUI:
         else:
             self._message_vertical_scroll = max(0, min(self._message_vertical_scroll, bottom))
 
+    def _follow_message_tail(self) -> None:
+        self._message_follow_tail = True
+        self._sync_message_scroll()
+
     def _message_page_size(self) -> int:
         return max(4, self._message_window_height() - 2)
 
+    def _selector_page_size(self, *, row_height: int = 1) -> int:
+        return max(1, (self._message_window_height() - 6) // row_height)
+
+    def _selector_slice(
+        self,
+        total: int,
+        index: int,
+        *,
+        row_height: int = 1,
+    ) -> tuple[int, int]:
+        page_size = min(total, self._selector_page_size(row_height=row_height))
+        start = min(max(0, index - page_size // 2), max(0, total - page_size))
+        return start, start + page_size
+
+    def _scroll_active_view(self, line_delta: int) -> None:
+        step = -1 if line_delta < 0 else 1
+        if getattr(self, "_model_choices", None) and self._move_model_choice(step):
+            return
+        if getattr(self, "_session_choices", None) and self._move_session_choice(step):
+            return
+        if getattr(self, "_rewind_choices", None) and self._move_rewind_choice(step):
+            return
+        if getattr(self, "_confirmation_future", None) is not None and self._move_confirmation(step):
+            return
+        self._scroll_messages(line_delta)
+
     def _message_window_height(self) -> int:
+        display_height = getattr(self, "_message_display_height", None)
+        if isinstance(display_height, int) and display_height > 0:
+            return display_height
         render_info = getattr(self._message_window, "render_info", None)
         height = getattr(render_info, "window_height", None)
         return height if isinstance(height, int) and height > 0 else 12
 
     def _message_window_width(self) -> int:
+        display_width = getattr(self, "_message_display_width", None)
+        if isinstance(display_width, int) and display_width > 0:
+            return display_width
         render_info = getattr(self._message_window, "render_info", None)
         width = getattr(render_info, "window_width", None)
         return width if isinstance(width, int) and width > 0 else 100
@@ -776,9 +846,6 @@ class SpiceTUI:
     def _scroll_messages(self, line_delta: int) -> None:
         text = self._message_buffer.text
         if not text:
-            return
-        lines = self._message_lines(text)
-        if not lines:
             return
         bottom = self._message_bottom_scroll(text)
         current_scroll = max(0, min(self._message_vertical_scroll, bottom))
@@ -788,12 +855,6 @@ class SpiceTUI:
             return
         self._message_vertical_scroll = new_scroll
         self._message_follow_tail = new_scroll >= bottom
-        cursor_row = min(len(lines) - 1, new_scroll + self._message_window_height() - 1)
-        cursor_position = Document(text).translate_row_col_to_index(cursor_row, 0)
-        self._message_buffer.set_document(
-            Document(text, cursor_position=cursor_position),
-            bypass_readonly=True,
-        )
 
     def _ensure_newline(self) -> None:
         if self._message_buffer.text and not self._message_buffer.text.endswith("\n"):
@@ -1065,7 +1126,13 @@ class SpiceTUI:
     def _move_model_choice(self, step: int) -> bool:
         if not self._model_choices:
             return False
-        self._model_choice_index = (self._model_choice_index + step) % len(self._model_choices)
+        if abs(step) == 1:
+            self._model_choice_index = (self._model_choice_index + step) % len(self._model_choices)
+        else:
+            self._model_choice_index = max(
+                0,
+                min(len(self._model_choices) - 1, self._model_choice_index + step),
+            )
         self._render_model_selector()
         return True
 
@@ -1091,12 +1158,18 @@ class SpiceTUI:
             return
         current = self._agent_session.model
         lines = ["", "Select model (up/down, enter, esc)", ""]
-        for index, model in enumerate(self._model_choices):
+        start, end = self._selector_slice(len(self._model_choices), self._model_choice_index)
+        if start:
+            lines.append(f"  ↑ {start} more")
+        for index in range(start, end):
+            model = self._model_choices[index]
             arrow = "❯" if index == self._model_choice_index else " "
             active = "*" if model.provider == current.provider and model.id == current.id else " "
             key_status = "key ok" if get_api_key(model.provider, env_names=model.api_key_envs) else "missing key"
             provider = model.provider_name or model.provider
             lines.append(f"{arrow} {active} {model.provider}/{model.id}  {provider}  {key_status}")
+        if end < len(self._model_choices):
+            lines.append(f"  ↓ {len(self._model_choices) - end} more")
         lines.append("")
         self._replace_from(self._model_choice_start, "\n".join(lines) + "\n")
 
@@ -1153,7 +1226,13 @@ class SpiceTUI:
     def _move_session_choice(self, step: int) -> bool:
         if not self._session_choices:
             return False
-        self._session_choice_index = (self._session_choice_index + step) % len(self._session_choices)
+        if abs(step) == 1:
+            self._session_choice_index = (self._session_choice_index + step) % len(self._session_choices)
+        else:
+            self._session_choice_index = max(
+                0,
+                min(len(self._session_choices) - 1, self._session_choice_index + step),
+            )
         self._render_session_selector()
         return True
 
@@ -1190,11 +1269,21 @@ class SpiceTUI:
         )
         action = "session to delete" if self._session_choice_mode == "delete" else "session"
         lines = ["", f"Select {action} (up/down, enter, esc)", ""]
-        for index, (session_id, model, details) in enumerate(self._session_choice_rows):
+        start, end = self._selector_slice(
+            len(self._session_choice_rows),
+            self._session_choice_index,
+            row_height=2,
+        )
+        if start:
+            lines.append(f"  ↑ {start} more")
+        for index in range(start, end):
+            session_id, model, details = self._session_choice_rows[index]
             arrow = "❯" if index == self._session_choice_index else " "
             active = "√" if session_id == active_session_id else " "
             lines.append(f"{arrow} {active} {session_id}  {model}")
             lines.append(f"      {details}")
+        if end < len(self._session_choice_rows):
+            lines.append(f"  ↓ {len(self._session_choice_rows) - end} more")
         lines.append("")
         self._replace_from(self._session_choice_start, "\n".join(lines) + "\n")
 
@@ -1233,7 +1322,13 @@ class SpiceTUI:
     def _move_rewind_choice(self, step: int) -> bool:
         if not self._rewind_choices:
             return False
-        self._rewind_choice_index = (self._rewind_choice_index + step) % len(self._rewind_choices)
+        if abs(step) == 1:
+            self._rewind_choice_index = (self._rewind_choice_index + step) % len(self._rewind_choices)
+        else:
+            self._rewind_choice_index = max(
+                0,
+                min(len(self._rewind_choices) - 1, self._rewind_choice_index + step),
+            )
         self._render_rewind_selector()
         return True
 
@@ -1258,9 +1353,15 @@ class SpiceTUI:
 
     def _render_rewind_selector(self) -> None:
         lines = ["", "Select rewind entry (up/down, enter, esc)", ""]
-        for index, (entry_id, details) in enumerate(self._rewind_choice_rows):
+        start, end = self._selector_slice(len(self._rewind_choice_rows), self._rewind_choice_index)
+        if start:
+            lines.append(f"  ↑ {start} more")
+        for index in range(start, end):
+            entry_id, details = self._rewind_choice_rows[index]
             arrow = "❯" if index == self._rewind_choice_index else " "
             lines.append(f"{arrow} {entry_id}  {details}")
+        if end < len(self._rewind_choice_rows):
+            lines.append(f"  ↓ {len(self._rewind_choice_rows) - end} more")
         lines.append("")
         self._replace_from(self._rewind_choice_start, "\n".join(lines) + "\n")
 
@@ -1583,9 +1684,11 @@ class SpiceTUI:
             self._ensure_newline()
             self._append(f"Resume failed: {exc}\n")
             return
-        self._ensure_newline()
+        # A resumed session replaces the current conversation view. Resetting
+        # follow-tail is essential when the previous view was scrolled up.
+        self._clear_conversation()
         self._append(f"Resumed session: {self._agent_session.session_label}\n")
-        # Display session history
+        self._append(f"Model: {self._agent_session.runtime_model_label}\n")
         self._display_session_history()
         self._refresh_completer()
 
@@ -1833,6 +1936,7 @@ class SpiceTUI:
         if not text:
             return False  # clear input
         buffer.reset(append_to_history=True)
+        self._follow_message_tail()
 
         if self._busy:
             self._ensure_newline()
