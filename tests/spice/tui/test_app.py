@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from prompt_toolkit.buffer import Buffer
@@ -175,6 +176,50 @@ def test_tui_scrolls_message_history_off_tail() -> None:
     assert tui._message_follow_tail is False
 
 
+def test_tui_scrolls_wrapped_message_history_off_tail() -> None:
+    tui = _minimal_tui()
+    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=3, window_width=11))
+    tui._append("0123456789" * 5)
+
+    assert tui._message_display_lines() == ["0123456789"] * 5
+    assert tui._message_vertical_scroll == 2
+
+    tui._scroll_messages(-1)
+
+    assert tui._message_vertical_scroll == 1
+    assert tui._message_follow_tail is False
+
+
+def test_tui_rendered_window_keeps_tail_and_manual_scroll_visible() -> None:
+    tui = SpiceTUI()
+    tui._append("\n".join(f"line {index}" for index in range(20)))
+
+    content = tui._message_control.create_content(width=20, height=5)
+    tui._message_window._scroll(content, width=20, height=5)
+
+    assert tui._message_vertical_scroll == 15
+    assert tui._message_window.vertical_scroll == 15
+
+    tui._scroll_messages(-3)
+    content = tui._message_control.create_content(width=20, height=5)
+    tui._message_window._scroll(content, width=20, height=5)
+
+    assert tui._message_vertical_scroll == 12
+    assert tui._message_window.vertical_scroll == 12
+
+
+def test_tui_message_content_supports_preferred_height_probe() -> None:
+    tui = SpiceTUI()
+    tui._append("history\n" * 20)
+
+    content = tui._message_control.create_content(width=80, height=None)
+    preferred_height = tui._message_control.preferred_height(80, 100, False, None)
+
+    assert content.line_count == 21
+    assert preferred_height == 21
+    assert tui._message_cursor_position().y == 20
+
+
 def test_tui_mouse_wheel_scrolls_message_history_from_message_and_input_controls() -> None:
     tui = _minimal_tui()
     tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=3, window_width=80))
@@ -196,6 +241,110 @@ def test_tui_mouse_wheel_scrolls_message_history_from_message_and_input_controls
     assert input_control.mouse_handler(event) is None
     assert tui._message_vertical_scroll == 1
     assert len(invalidated) == 2
+
+
+def test_tui_mouse_wheel_moves_session_selector_and_keeps_choice_visible() -> None:
+    tui = _minimal_tui()
+    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=10, window_width=80))
+    tui._session_choices = [f"session-{index}" for index in range(8)]
+    tui._session_choice_rows = [
+        (session_id, "provider/model", f"details {index}")
+        for index, session_id in enumerate(tui._session_choices)
+    ]
+    tui._session_choice_index = 0
+    tui._session_choice_start = 0
+    tui._session_choice_mode = "resume"
+    tui._agent_session = None
+    tui._render_session_selector()
+    event = MouseEvent(
+        position=Point(x=0, y=0),
+        event_type=MouseEventType.SCROLL_DOWN,
+        button=MouseButton.NONE,
+        modifiers=frozenset(),
+    )
+
+    control = _InputBufferControl(tui, buffer=Buffer())
+    assert control.mouse_handler(event) is None
+
+    assert tui._session_choice_index == 1
+    assert "❯   session-1" in tui._message_buffer.text
+    assert "session-7" not in tui._message_buffer.text
+
+
+def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monkeypatch) -> None:
+    tui = _minimal_tui()
+    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=5, window_width=21))
+    tui._provider = None
+    tui._model = None
+    tui._refresh_completer = lambda: None
+    tui._append("old conversation\n" * 10)
+    tui._scroll_messages(-3)
+    assert tui._message_follow_tail is False
+
+    resumed = SimpleNamespace(
+        session_label="session-123",
+        runtime_model_label="provider/model",
+        messages=[
+            SimpleNamespace(role="user", content="question", tool_calls=None),
+            SimpleNamespace(role="assistant", content="latest answer " * 20, tool_calls=None),
+        ],
+    )
+    monkeypatch.setattr("spice.tui.app.AgentSession", lambda **_kwargs: resumed)
+
+    tui._resume_session("session-123")
+
+    assert "old conversation" not in tui._message_buffer.text
+    assert "latest answer" in tui._message_buffer.text
+    assert tui._message_follow_tail is True
+    assert tui._message_vertical_scroll == tui._message_bottom_scroll()
+    assert tui._message_vertical_scroll > 0
+
+    bottom = tui._message_vertical_scroll
+    tui._scroll_messages(-3)
+    assert tui._message_vertical_scroll == bottom - 3
+    assert tui._message_follow_tail is False
+    tui._scroll_messages(3)
+    assert tui._message_vertical_scroll == bottom
+    assert tui._message_follow_tail is True
+
+
+def test_tui_submitting_message_leaves_history_mode_and_follows_response() -> None:
+    async def exercise() -> None:
+        tui = _minimal_tui()
+        tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=4, window_width=30))
+        tui._busy = False
+        tui._show_edit_mode_hint = False
+        tui._agent_session = SimpleNamespace(
+            plan_state=SimpleNamespace(mode="edit", is_plan_mode=False),
+        )
+        tui._append("old line\n" * 20)
+        tui._scroll_messages(-6)
+        assert tui._message_follow_tail is False
+
+        prompts = []
+
+        async def run_prompt(message: str) -> None:
+            prompts.append(message)
+
+        tui._run_prompt = run_prompt
+        input_buffer = Buffer()
+        input_buffer.text = "new question"
+
+        assert tui._on_accept(input_buffer) is True
+        await tui._pending_task
+
+        assert prompts == ["new question"]
+        assert tui._message_follow_tail is True
+        assert tui._message_vertical_scroll == tui._message_bottom_scroll()
+        assert tui._message_buffer.text.endswith("You: new question\n")
+
+        tui._render_event(TurnStartEvent(prompt="new question"))
+        tui._render_event(TextDeltaEvent("visible response"))
+        assert tui._message_follow_tail is True
+        assert tui._message_vertical_scroll == tui._message_bottom_scroll()
+        assert tui._message_buffer.text.endswith("Spice: visible response")
+
+    asyncio.run(exercise())
 
 
 def test_tui_message_history_does_not_take_focus_from_input() -> None:
