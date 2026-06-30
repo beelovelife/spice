@@ -65,6 +65,8 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
                 result = await web_search({"query": "spice"}, ToolContext(cwd=Path(directory)))
 
         self.assertTrue(result.is_error)
+        self.assertEqual(result.disposition, "recoverable")
+        self.assertEqual(result.error_code, "tool_configuration_missing")
         self.assertIn("TAVILY_API_KEY", result.content)
         self.assertEqual(FakeAsyncTavilyClient.api_keys, [])
 
