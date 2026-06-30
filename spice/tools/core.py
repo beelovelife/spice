@@ -19,5 +19,6 @@ def create_core_tools() -> list[Tool]:
             description="Return the current UTC time as an ISO-8601 timestamp.",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             execute=get_current_time,
+            concurrency="parallel",
         )
     ]

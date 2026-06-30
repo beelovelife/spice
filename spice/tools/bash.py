@@ -8,7 +8,7 @@ import signal  # Re-exported with os for process-group cleanup tests.
 from typing import Any
 
 from spice.sandbox.factory import create_environment, create_workspace_policy
-from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result, truncate_head
+from spice.tools.base import Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head
 
 
 async def bash(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -22,7 +22,7 @@ async def bash(args: dict[str, Any], context: ToolContext) -> ToolResult:
         cwd = workspace.resolve_exec_cwd(str(args.get("cwd") or "."))
         result = await environment.run(command, cwd=cwd, timeout=timeout)
     except (PermissionError, RuntimeError) as exc:
-        return tool_error(str(exc))
+        return fatal_tool_error(str(exc), code="execution_policy_denied")
     if result.timed_out:
         return tool_error(f"Command timed out after {timeout:g}s: {command}", result.details)
     content = result.output

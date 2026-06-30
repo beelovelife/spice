@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from spice.skills.loader import linked_files, load_skills
-from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result
+from spice.tools.base import Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result
 
 
 async def skills_list(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -30,7 +30,7 @@ async def skill_view(args: dict[str, Any], context: ToolContext) -> ToolResult:
         target = (skill.path.parent / file_path).resolve()
         root = skill.path.parent.resolve()
         if root not in (target, *target.parents):
-            return tool_error("file_path must stay inside the skill directory.")
+            return fatal_tool_error("file_path must stay inside the skill directory.", code="skill_path_denied")
         if not target.is_file():
             return tool_error(f"Linked skill file does not exist: {file_path}")
         return tool_result(target.read_text(encoding="utf-8"), {"path": str(target)})
@@ -50,6 +50,7 @@ def create_skill_tools() -> list[Tool]:
             description="List available Spice skills with source and short descriptions.",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             execute=skills_list,
+            concurrency="parallel",
         ),
         Tool(
             name="skill_view",
@@ -64,5 +65,6 @@ def create_skill_tools() -> list[Tool]:
                 "additionalProperties": False,
             },
             execute=skill_view,
+            concurrency="parallel",
         ),
     ]

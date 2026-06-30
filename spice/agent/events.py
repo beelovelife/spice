@@ -61,6 +61,30 @@ class ToolExecutionEndEvent(AgentEvent):
 
 
 @dataclass
+class ModelRetryEvent(AgentEvent):
+    provider: str
+    model: str
+    failed_attempt: int
+    next_attempt: int
+    max_attempts: int
+    delay_seconds: float
+    error: str
+
+
+@dataclass
+class ModelFallbackEvent(AgentEvent):
+    from_profile: str
+    from_provider: str
+    from_model: str
+    to_profile: str
+    to_provider: str
+    to_model: str
+    reason: str
+    fallback_index: int
+    fallback_count: int
+
+
+@dataclass
 class TurnEndEvent(AgentEvent):
     text: str
     stop_reason: str = "stop"
@@ -69,3 +93,4 @@ class TurnEndEvent(AgentEvent):
 @dataclass
 class AgentErrorEvent(AgentEvent):
     message: str
+    kind: str = "error"

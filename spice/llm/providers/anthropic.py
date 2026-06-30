@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 from spice.agent.logging_config import get_logger
-from spice.llm.error_safety import public_exception_message
+from spice.llm.error_safety import stream_error_from_exception
 from spice.llm.messages import Message
 from spice.llm.models import Model
 from spice.llm.types import Done, StreamError, StreamEvent, ModelRequestOptions, TextDelta, ToolCallEvent, ToolSchema
@@ -27,17 +27,22 @@ class AnthropicProvider:
         options: ModelRequestOptions,
     ) -> AsyncIterator[StreamEvent]:
         if not options.api_key:
-            yield StreamError("Missing Anthropic API key. Set ANTHROPIC_API_KEY or run `spice config set api-key <key>`.")
+            yield StreamError(
+                "Missing Anthropic API key. Set ANTHROPIC_API_KEY or run `spice config set api-key <key>`.",
+                kind="authentication",
+                provider=model.provider,
+                model=model.id,
+            )
             return
         try:
             from anthropic import AsyncAnthropic
         except ImportError:
-            yield StreamError("Package `anthropic` is not installed. Run `uv add anthropic`.")
+            yield StreamError("Package `anthropic` is not installed. Run `uv add anthropic`.", kind="unsupported")
             return
 
         system, anthropic_messages = _messages_to_anthropic(messages)
         base_url = options.base_url or self.default_base_url
-        client = AsyncAnthropic(api_key=options.api_key, base_url=base_url)
+        client = AsyncAnthropic(api_key=options.api_key, base_url=base_url, max_retries=0)
         started = time.perf_counter()
         try:
             logger.info(
@@ -77,7 +82,12 @@ class AnthropicProvider:
                 model.id,
                 int((time.perf_counter() - started) * 1000),
             )
-            yield StreamError(public_exception_message(exc, prefix="Provider request failed"))
+            yield stream_error_from_exception(
+                exc,
+                prefix="Provider request failed",
+                provider=model.provider,
+                model=model.id,
+            )
 
 
 def _messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:

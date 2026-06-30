@@ -8,6 +8,8 @@ from spice.agent.events import (
     AgentEndEvent,
     AgentStartEvent,
     AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -54,6 +56,8 @@ def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(tmp
     call = ToolCall(id="tc1", name="read_file", arguments={"path": "README.md"})
     session.messages.append(Message(role="assistant", content="", tool_calls=[call], provider="openai", model="gpt-5.1"))
     writer.record(AssistantMessageEvent(text="", tool_calls=[call]))
+    writer.record(ModelRetryEvent("openai", "gpt-5.1", 1, 2, 3, 0.5, "temporary"))
+    writer.record(ModelFallbackEvent("primary", "openai", "gpt-5.1", "backup", "anthropic", "claude", "server", 0, 1))
     writer.record(ToolExecutionStartEvent(tool_call_id="tc1", tool_name="read_file", args={"path": "README.md"}))
     session.messages.append(Message(role="tool", content="# README", tool_call_id="tc1", name="read_file"))
     writer.record(ToolExecutionEndEvent(tool_call_id="tc1", tool_name="read_file", result=tool_result("# README")))
@@ -75,6 +79,8 @@ def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(tmp
     assert data["summary"]["tool_calls"] == 1
     assert data["summary"]["text_delta_events"] == 2
     assert data["summary"]["text_delta_chars"] == len("hello world")
+    assert "model_retry" in {event["type"] for event in data["events"]}
+    assert "model_fallback" in {event["type"] for event in data["events"]}
 
 
 def test_run_command_trace_file_wires_runtime_writer(monkeypatch, tmp_path: Path) -> None:

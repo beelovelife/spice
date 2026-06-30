@@ -101,6 +101,30 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.storage["backend"], "sqlite")
             self.assertEqual(config.storage["sqlitePath"], str(Path(directory) / "spice.db"))
 
+    def test_load_config_normalizes_tool_and_model_routing_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "tools": {"max_concurrency": 99, "default_timeout_seconds": 0},
+                        "modelRouting": {
+                            "retry": {"enabled": False, "maxAttempts": 12},
+                            "fallback": {"enabled": True, "profiles": ["a", "b", "c", "d"]},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(config_module, "SETTINGS_PATH", settings_path):
+                config = load_config()
+
+            self.assertEqual(config.tools, {"max_concurrency": 16, "default_timeout_seconds": 1.0})
+            self.assertFalse(config.model_routing["retry"]["enabled"])
+            self.assertEqual(config.model_routing["retry"]["maxAttempts"], 5)
+            self.assertEqual(config.model_routing["fallback"]["profiles"], ["a", "b", "c"])
+
     def test_load_config_rejects_unknown_storage_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings_path = Path(directory) / "settings.json"

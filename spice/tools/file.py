@@ -8,14 +8,14 @@ from pathlib import Path
 
 from spice.sandbox.factory import create_workspace_policy
 from spice.sandbox.policy import WorkspacePolicy
-from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result, truncate_head
+from spice.tools.base import FatalToolError, Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head
 
 
 async def list_dir(args: dict, context: ToolContext) -> ToolResult:
     try:
         path = _workspace(context).resolve_read_dir(str(args.get("path") or "."))
     except PermissionError as exc:
-        return tool_error(str(exc))
+        return fatal_tool_error(str(exc), code="workspace_policy_denied")
     if not path.exists():
         return tool_error(f"Path does not exist: {path}")
     if not path.is_dir():
@@ -49,7 +49,7 @@ async def read_file(args: dict, context: ToolContext) -> ToolResult:
     try:
         path = _workspace(context).resolve_read(str(args.get("path") or ""))
     except PermissionError as exc:
-        return tool_error(str(exc))
+        return fatal_tool_error(str(exc), code="workspace_policy_denied")
     offset = int(args.get("offset") or 0)
     limit = int(args.get("limit") or 12000)
     if offset < 0:
@@ -91,7 +91,7 @@ async def write_file(args: dict, context: ToolContext) -> ToolResult:
     try:
         path = _workspace(context).resolve_write(str(args.get("path") or ""), content_size=len(content.encode("utf-8")))
     except PermissionError as exc:
-        return tool_error(str(exc))
+        return fatal_tool_error(str(exc), code="workspace_policy_denied")
     if context.file_states:
         stale_error = context.file_states.check_before_overwrite(path)
         if stale_error:
@@ -116,7 +116,7 @@ async def edit_file(args: dict, context: ToolContext) -> ToolResult:
     try:
         path = _workspace(context).resolve_write(str(args.get("path") or ""), content_size=len(new.encode("utf-8")))
     except PermissionError as exc:
-        return tool_error(str(exc))
+        return fatal_tool_error(str(exc), code="workspace_policy_denied")
     if not path.exists():
         return tool_error(f"File does not exist: {path}")
     if context.file_states:
@@ -218,7 +218,7 @@ def _plan_patch_operation(
     try:
         path = _workspace(context).resolve_write(path_arg, content_size=0)
     except PermissionError as exc:
-        return None, str(exc)
+        raise FatalToolError(str(exc), code="workspace_policy_denied") from exc
     current_loaded = path in after_by_path
     try:
         current = after_by_path[path] if current_loaded else _read_existing_patch_content(path)
@@ -411,7 +411,7 @@ async def read_files(args: dict, context: ToolContext) -> ToolResult:
         try:
             path = _workspace(context).resolve_read(raw_path)
         except PermissionError as exc:
-            return tool_error(str(exc))
+            return fatal_tool_error(str(exc), code="workspace_policy_denied")
         if not path.exists():
             return tool_error(f"File does not exist: {path}")
         if not path.is_file():
@@ -459,7 +459,7 @@ async def search_files(args: dict, context: ToolContext) -> ToolResult:
     try:
         path = _workspace(context).resolve_read_dir(str(args.get("path") or "."))
     except PermissionError as exc:
-        return tool_error(str(exc))
+        return fatal_tool_error(str(exc), code="workspace_policy_denied")
     if not pattern:
         return tool_error("pattern is required.")
     matches: list[str] = []
@@ -529,6 +529,7 @@ def create_file_tools() -> list[Tool]:
                 },
             },
             list_dir,
+            concurrency="parallel",
         ),
         Tool(
             "read_file",
@@ -547,6 +548,7 @@ def create_file_tools() -> list[Tool]:
                 "required": ["path"],
             },
             read_file,
+            concurrency="parallel",
         ),
         Tool(
             "read_files",
@@ -574,6 +576,7 @@ def create_file_tools() -> list[Tool]:
                 "required": ["files"],
             },
             read_files,
+            concurrency="parallel",
         ),
         Tool(
             "write_file",
@@ -643,5 +646,6 @@ def create_file_tools() -> list[Tool]:
                 "required": ["pattern"],
             },
             search_files,
+            concurrency="parallel",
         ),
     ]

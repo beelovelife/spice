@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from spice.agent.subagent import SubagentManager
@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 ConfirmFn = Callable[[str, dict[str, Any]], Awaitable[bool]]
+ToolConcurrency = Literal["serial", "parallel"]
+ToolFailureDisposition = Literal["recoverable", "fatal"]
 
 
 @dataclass
@@ -22,6 +24,8 @@ class ToolResult:
     content: str
     is_error: bool = False
     details: dict[str, Any] = field(default_factory=dict)
+    disposition: ToolFailureDisposition = "recoverable"
+    error_code: str | None = None
 
 
 @dataclass
@@ -45,6 +49,26 @@ class Tool:
     parameters: dict[str, Any]
     execute: ToolExecuteFn
     requires_confirmation: bool = False
+    concurrency: ToolConcurrency = "serial"
+    timeout_seconds: float | None = None
+
+
+class RecoverableToolError(Exception):
+    """Expected tool failure that the model may be able to correct."""
+
+    def __init__(self, message: str, *, code: str = "recoverable_tool_error", details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+class FatalToolError(Exception):
+    """Tool failure that must stop the current turn."""
+
+    def __init__(self, message: str, *, code: str = "fatal_tool_error", details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
 
 
 def validate_tool_arguments(schema: dict[str, Any], args: dict[str, Any]) -> list[str]:
@@ -236,8 +260,28 @@ def tool_result(content: str, details: dict[str, Any] | None = None) -> ToolResu
     return ToolResult(content=content, details=details or {})
 
 
-def tool_error(content: str, details: dict[str, Any] | None = None) -> ToolResult:
-    return ToolResult(content=content, is_error=True, details=details or {})
+def tool_error(
+    content: str,
+    details: dict[str, Any] | None = None,
+    *,
+    code: str | None = None,
+) -> ToolResult:
+    return ToolResult(content=content, is_error=True, details=details or {}, error_code=code)
+
+
+def fatal_tool_error(
+    content: str,
+    details: dict[str, Any] | None = None,
+    *,
+    code: str | None = None,
+) -> ToolResult:
+    return ToolResult(
+        content=content,
+        is_error=True,
+        details=details or {},
+        disposition="fatal",
+        error_code=code,
+    )
 
 
 def truncate_head(text: str, limit: int = 12000) -> str:
