@@ -736,7 +736,7 @@ def config_path() -> None:
 
 @config_app.command("set")
 def config_set(key: str, value: str) -> None:
-    """Set default-model/api-key/debug.trace/memory.enabled/logging.retention_days/storage.*."""
+    """Set model, tool runtime, retry/fallback, storage, and diagnostic settings."""
     if key == "api-key":
         provider = load_config().provider
         save_secret(provider, value)
@@ -776,9 +776,44 @@ def config_set(key: str, value: str) -> None:
         if not sqlite_path:
             raise typer.BadParameter("storage.sqlitePath cannot be empty")
         config.storage["sqlitePath"] = sqlite_path
+    elif key in {"tools.max_concurrency", "tools_max_concurrency"}:
+        try:
+            config.tools["max_concurrency"] = min(max(int(value), 1), 16)
+        except ValueError as exc:
+            raise typer.BadParameter("tools.max_concurrency must be an integer from 1 to 16") from exc
+    elif key in {"tools.default_timeout_seconds", "tools_default_timeout_seconds"}:
+        try:
+            config.tools["default_timeout_seconds"] = min(max(float(value), 1.0), 3600.0)
+        except ValueError as exc:
+            raise typer.BadParameter("tools.default_timeout_seconds must be a number from 1 to 3600") from exc
+    elif key in {"modelRouting.retry.enabled", "model_routing.retry.enabled"}:
+        config.model_routing["retry"]["enabled"] = _parse_bool(value)
+    elif key in {"modelRouting.retry.maxAttempts", "model_routing.retry.max_attempts"}:
+        try:
+            config.model_routing["retry"]["maxAttempts"] = min(max(int(value), 1), 5)
+        except ValueError as exc:
+            raise typer.BadParameter("modelRouting.retry.maxAttempts must be an integer from 1 to 5") from exc
+    elif key in {"modelRouting.fallback.enabled", "model_routing.fallback.enabled"}:
+        config.model_routing["fallback"]["enabled"] = _parse_bool(value)
+    elif key in {"modelRouting.fallback.profiles", "model_routing.fallback.profiles"}:
+        profiles = [item.strip() for item in value.split(",") if item.strip()]
+        if len(profiles) > 3:
+            raise typer.BadParameter("modelRouting.fallback.profiles accepts at most 3 comma-separated profiles")
+        if len(set(profiles)) != len(profiles):
+            raise typer.BadParameter("modelRouting.fallback.profiles cannot contain duplicates")
+        registry = ModelRegistry()
+        unknown = [profile for profile in profiles if registry.find(None, profile) is None]
+        if unknown:
+            raise typer.BadParameter(f"Unknown fallback model profiles: {', '.join(unknown)}")
+        primary = registry.find(config.provider, config.model)
+        repeated_primary = [profile for profile in profiles if registry.find(None, profile) == primary]
+        if repeated_primary:
+            raise typer.BadParameter("The primary model cannot also be a fallback profile")
+        config.model_routing["fallback"]["profiles"] = profiles
     else:
         raise typer.BadParameter(
-            "Supported keys: default-model, api-key, debug.trace, memory.enabled, logging.retention_days, storage.backend, storage.sqlitePath"
+            "Supported keys: default-model, api-key, debug.trace, memory.enabled, logging.retention_days, "
+            "storage.*, tools.*, modelRouting.retry.*, modelRouting.fallback.*"
         )
     save_config(config)
     console.print(f"Updated {key}.")
@@ -802,6 +837,24 @@ def config_get(key: str) -> None:
         return
     if key in {"storage.sqlitePath", "storage.sqlite_path", "storage_sqlite_path"}:
         console.print(config.storage.get("sqlitePath", "~/.spice/spice.db"))
+        return
+    if key in {"tools.max_concurrency", "tools_max_concurrency"}:
+        console.print(config.tools.get("max_concurrency", 4))
+        return
+    if key in {"tools.default_timeout_seconds", "tools_default_timeout_seconds"}:
+        console.print(config.tools.get("default_timeout_seconds", 120))
+        return
+    if key in {"modelRouting.retry.enabled", "model_routing.retry.enabled"}:
+        console.print(config.model_routing["retry"].get("enabled", True))
+        return
+    if key in {"modelRouting.retry.maxAttempts", "model_routing.retry.max_attempts"}:
+        console.print(config.model_routing["retry"].get("maxAttempts", 3))
+        return
+    if key in {"modelRouting.fallback.enabled", "model_routing.fallback.enabled"}:
+        console.print(config.model_routing["fallback"].get("enabled", False))
+        return
+    if key in {"modelRouting.fallback.profiles", "model_routing.fallback.profiles"}:
+        console.print(",".join(config.model_routing["fallback"].get("profiles", [])))
         return
     if key in {"default-model", "defaultModel"}:
         console.print(config.default_model)

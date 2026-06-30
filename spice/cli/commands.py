@@ -659,7 +659,7 @@ class SlashCommandRegistry:
         memory_enabled = config.memory_enabled
         subagents_enabled = config.subagents_enabled
         registry = create_all_tools(memory_enabled=memory_enabled, subagents_enabled=subagents_enabled)
-        table = Table("Tool", "Toolset", "Risk", "Description")
+        table = Table("Tool", "Toolset", "Risk", "Execution", "Timeout", "Description")
         for toolset, names in TOOLSETS.items():
             if toolset == "memory" and not memory_enabled:
                 continue
@@ -670,7 +670,8 @@ class SlashCommandRegistry:
                 if not tool:
                     continue
                 risk = "read-only" if name in READ_ONLY_TOOLS and not tool.requires_confirmation else "write/exec"
-                table.add_row(name, toolset, risk, tool.description)
+                timeout = f"{tool.timeout_seconds:g}s" if tool.timeout_seconds is not None else "default"
+                table.add_row(name, toolset, risk, tool.concurrency, timeout, tool.description)
         console.print(table)
 
     def _print_settings(self, context: InteractiveCommandContext) -> None:
@@ -687,6 +688,12 @@ class SlashCommandRegistry:
         table.add_row("subagents.max_concurrent", str(getattr(manager, "max_concurrent", config.max_concurrent_subagents)))
         table.add_row("logging.retention_days", str(config.logging_retention_days))
         table.add_row("debug.trace", str(config.debug_trace))
+        table.add_row("tools.max_concurrency", str(config.tools.get("max_concurrency", 4)))
+        table.add_row("tools.default_timeout_seconds", str(config.tools.get("default_timeout_seconds", 120)))
+        table.add_row("model retry", str(config.model_routing["retry"].get("enabled", True)).lower())
+        table.add_row("model retry attempts", str(config.model_routing["retry"].get("maxAttempts", 3)))
+        table.add_row("model fallback", str(config.model_routing["fallback"].get("enabled", False)).lower())
+        table.add_row("fallback profiles", ", ".join(config.model_routing["fallback"].get("profiles", [])) or "(none)")
         table.add_row("output_tokens", str(context.agent_session.model.output_tokens))
         plan_state = getattr(context.agent_session, "plan_state", None)
         table.add_row("mode", getattr(plan_state, "mode", "edit"))

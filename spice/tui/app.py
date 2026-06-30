@@ -50,6 +50,8 @@ from spice.agent.events import (
     AgentEvent,
     AgentStartEvent,
     AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -1397,6 +1399,12 @@ class SpiceTUI:
         table.add_row("subagents.enabled", str(self._agent_session.subagents_enabled).lower())
         table.add_row("subagents.max_concurrent", str(self._agent_session.subagent_manager.max_concurrent))
         table.add_row("logging.retention_days", str(config.logging_retention_days))
+        table.add_row("tools.max_concurrency", str(config.tools.get("max_concurrency", 4)))
+        table.add_row("tools.default_timeout_seconds", str(config.tools.get("default_timeout_seconds", 120)))
+        table.add_row("model retry", str(config.model_routing["retry"].get("enabled", True)).lower())
+        table.add_row("model retry attempts", str(config.model_routing["retry"].get("maxAttempts", 3)))
+        table.add_row("model fallback", str(config.model_routing["fallback"].get("enabled", False)).lower())
+        table.add_row("fallback profiles", ", ".join(config.model_routing["fallback"].get("profiles", [])) or "(none)")
         table.add_row("output tokens", str(self.agent_session.model.output_tokens))
         table.add_row("mode", self._agent_session.plan_state.mode)
         if self._agent_session.todo_state.status_line():
@@ -1416,6 +1424,7 @@ class SpiceTUI:
                 continue
             table.add_row(name, ", ".join(tools))
         table.add_row("read-only", ", ".join(name for name in READ_ONLY_TOOLS if name in registry))
+        table.add_row("parallel", ", ".join(name for name, tool in registry.items() if tool.concurrency == "parallel"))
         self._append_table(table)
 
     def _handle_subagent_command(self, arg: str) -> None:
@@ -1944,6 +1953,20 @@ class SpiceTUI:
             self._streaming = False
             self._response_parts = []
             self._ensure_newline()
+        elif isinstance(event, ModelRetryEvent):
+            self._stop_waiting_indicator(clear=True)
+            self._ensure_newline()
+            self._append(
+                f"Model request failed temporarily. Retrying {event.next_attempt}/{event.max_attempts} "
+                f"in {event.delay_seconds:.1f}s ({event.provider}/{event.model}).\n"
+            )
+        elif isinstance(event, ModelFallbackEvent):
+            self._stop_waiting_indicator(clear=True)
+            self._ensure_newline()
+            self._append(
+                f"Model fallback: {event.from_provider}/{event.from_model} -> "
+                f"{event.to_provider}/{event.to_model} (this turn, reason: {event.reason}).\n"
+            )
         elif isinstance(event, ToolExecutionStartEvent):
             self._stop_waiting_indicator(clear=True)
             self._ensure_newline()
@@ -1982,7 +2005,8 @@ class SpiceTUI:
             self._streaming = False
             self._ensure_newline()
             self._flush_compact_tool_group()
-            self._append(f"Error: {event.message}\n")
+            label = "Current turn stopped" if event.kind == "fatal_tool" else "Error"
+            self._append(f"{label}: {event.message}\n")
         elif isinstance(event, TurnEndEvent):
             self._stop_waiting_indicator(clear=True)
             self._streaming = False

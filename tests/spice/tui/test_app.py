@@ -6,7 +6,16 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
-from spice.agent.events import AssistantMessageEvent, TextDeltaEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, TurnStartEvent
+from spice.agent.events import (
+    AgentErrorEvent,
+    AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
+    TextDeltaEvent,
+    ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
+    TurnStartEvent,
+)
 from spice.llm.messages import ToolCall
 from spice.tools.base import tool_result
 from spice.tui.app import SpiceTUI, _InputBufferControl, _MessageBufferControl
@@ -88,6 +97,19 @@ def test_tui_renders_thought_label_between_user_and_answer() -> None:
     tui._render_event(AssistantMessageEvent(text="你好", tool_calls=[]))
 
     assert tui._message_buffer.text == "Thought for 0s\n\nSpice: 你好\n"
+
+
+def test_tui_shows_retry_fallback_and_fatal_tool_stop() -> None:
+    tui = _minimal_tui()
+
+    tui._render_event(ModelRetryEvent("openai", "primary", 1, 2, 3, 0.5, "temporary"))
+    tui._render_event(ModelFallbackEvent("primary", "openai", "primary", "backup", "anthropic", "backup", "server", 0, 1))
+    tui._render_event(AgentErrorEvent("Tool denied by user: bash", kind="fatal_tool"))
+
+    rendered = tui._message_buffer.text
+    assert "Retrying 2/3 in 0.5s" in rendered
+    assert "openai/primary -> anthropic/backup" in rendered
+    assert "Current turn stopped: Tool denied by user: bash" in rendered
     assert "thinking" not in tui._message_buffer.text
     assert tui._waiting_started is None
 

@@ -11,9 +11,11 @@ from uuid import uuid4
 
 from spice.agent.events import AgentErrorEvent, AssistantMessageEvent, ToolExecutionEndEvent, TurnEndEvent
 from spice.agent.prompts import build_system_prompt
-from spice.llm.config import load_config
+from spice.llm.config import get_api_key, load_config
 from spice.llm.messages import Message
+from spice.llm.model_registry import ModelRegistry
 from spice.llm.models import Model
+from spice.llm.routing import build_model_route
 from spice.llm.types import ModelRequestOptions
 from spice.sandbox.factory import create_environment, create_workspace_policy
 from spice.tools.base import ConfirmFn, Tool, truncate_tail
@@ -125,9 +127,9 @@ class SubagentManager:
         self.max_concurrent = max_concurrent
         self.max_tool_rounds = max_tool_rounds
         self.result_chars = result_chars
-        config = load_config()
-        self.workspace_policy = create_workspace_policy(config.sandbox, cwd=self.cwd)
-        self.environment = create_environment(config.sandbox, cwd=self.cwd)
+        self.config = load_config()
+        self.workspace_policy = create_workspace_policy(self.config.sandbox, cwd=self.cwd)
+        self.environment = create_environment(self.config.sandbox, cwd=self.cwd)
 
     def set_model(self, model: Model) -> None:
         self.model = model
@@ -151,6 +153,12 @@ class SubagentManager:
         rounds = 0
         tool_count = 0
         error: str | None = None
+        route = build_model_route(
+            self.model,
+            routing_settings=self.config.model_routing,
+            resolve_model=lambda profile: ModelRegistry().find(None, profile),
+            options_factory=self._options_for_model,
+        )
 
         try:
             async for event in run_turn(
@@ -166,6 +174,8 @@ class SubagentManager:
                 file_states=FileStateStore(),
                 session_label=f"subagent:{label}:{task_id}",
                 max_tool_rounds=self.max_tool_rounds,
+                model_route=route,
+                tools_settings=self.config.tools,
             ):
                 if isinstance(event, AssistantMessageEvent):
                     rounds += 1
@@ -203,6 +213,15 @@ class SubagentManager:
             for tool in self.tools_factory()
             if tool.name not in {"spawn_subagents", "update_todo"}
         ]
+
+    def _options_for_model(self, model: Model) -> ModelRequestOptions:
+        if model.provider == self.model.provider and model.id == self.model.id:
+            return self.options_factory()
+        return ModelRequestOptions(
+            api_key=get_api_key(model.provider, env_names=model.api_key_envs),
+            base_url=model.base_url,
+            temperature=model.temperature if model.temperature is not None else self.config.temperature,
+        )
 
     def _build_system_prompt(self) -> str:
         base = build_system_prompt(

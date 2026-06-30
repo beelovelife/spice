@@ -8,7 +8,7 @@ from typing import Any
 from tavily import AsyncTavilyClient
 
 from spice.llm.config import get_api_key
-from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result, truncate_head
+from spice.tools.base import Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head
 
 
 async def web_search(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -18,7 +18,7 @@ async def web_search(args: dict[str, Any], context: ToolContext) -> ToolResult:
         return tool_error("query is required.")
     api_key = get_api_key("tavily")
     if not api_key:
-        return tool_error("TAVILY_API_KEY is not configured.")
+        return fatal_tool_error("TAVILY_API_KEY is not configured.", code="authentication_missing")
     client = AsyncTavilyClient(api_key=api_key)
     try:
         response = await client.search(query=query, max_results=max_results)
@@ -55,5 +55,6 @@ def create_web_tools() -> list[Tool]:
                 "additionalProperties": False,
             },
             execute=web_search,
+            concurrency="parallel",
         )
     ]

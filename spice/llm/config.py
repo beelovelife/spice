@@ -65,6 +65,27 @@ DEFAULT_STORAGE_CONFIG: dict[str, Any] = {
     "sqlitePath": "~/.spice/spice.db",
 }
 
+DEFAULT_TOOLS_CONFIG: dict[str, Any] = {
+    "max_concurrency": 4,
+    "default_timeout_seconds": 120,
+}
+
+DEFAULT_MODEL_ROUTING_CONFIG: dict[str, Any] = {
+    "retry": {
+        "enabled": True,
+        "maxAttempts": 3,
+        "baseDelayMs": 500,
+        "maxDelayMs": 10_000,
+        "multiplier": 2.0,
+        "honorRetryAfter": True,
+    },
+    "fallback": {
+        "enabled": False,
+        "profiles": [],
+        "resetOnNextTurn": True,
+    },
+}
+
 
 @dataclass
 class SpiceConfig:
@@ -82,6 +103,8 @@ class SpiceConfig:
     logging_retention_days: int = 7
     sandbox: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_SANDBOX_CONFIG))
     storage: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_STORAGE_CONFIG))
+    tools: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_TOOLS_CONFIG))
+    model_routing: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_MODEL_ROUTING_CONFIG))
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -191,6 +214,8 @@ def save_config(config: SpiceConfig) -> None:
         },
         "sandbox": config.sandbox,
         "storage": config.storage,
+        "tools": config.tools,
+        "modelRouting": config.model_routing,
     }
     _write_private_json(SETTINGS_PATH, payload)
 
@@ -260,11 +285,19 @@ def _config_values_from_settings(data: dict[str, Any]) -> dict[str, Any]:
     if isinstance(storage_settings, dict):
         values["storage"] = _normalize_storage_config(storage_settings)
 
+    tools_settings = data.get("tools")
+    if isinstance(tools_settings, dict):
+        values["tools"] = _normalize_tools_config(tools_settings)
+
+    routing_settings = data.get("modelRouting") or data.get("model_routing")
+    if isinstance(routing_settings, dict):
+        values["model_routing"] = _normalize_model_routing_config(routing_settings)
+
     # Backward-compatible flat settings for older config.json-style files.
     for key, value in data.items():
         if key not in SpiceConfig.__dataclass_fields__:
             continue
-        if key in {"sandbox", "storage", "model_profiles", "models", "defaultModel"}:
+        if key in {"sandbox", "storage", "tools", "model_routing", "model_profiles", "models", "defaultModel"}:
             continue
         if key == "model" and not isinstance(value, str):
             continue
@@ -280,6 +313,52 @@ def _normalize_storage_config(settings: dict[str, Any]) -> dict[str, Any]:
     sqlite_path = settings.get("sqlitePath") or settings.get("sqlite_path")
     if isinstance(sqlite_path, str) and sqlite_path.strip():
         result["sqlitePath"] = sqlite_path.strip()
+    return result
+
+
+def _normalize_tools_config(settings: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(DEFAULT_TOOLS_CONFIG)
+    try:
+        result["max_concurrency"] = min(max(int(settings.get("max_concurrency", result["max_concurrency"])), 1), 16)
+    except (TypeError, ValueError):
+        pass
+    try:
+        result["default_timeout_seconds"] = min(
+            max(float(settings.get("default_timeout_seconds", result["default_timeout_seconds"])), 1.0),
+            3600.0,
+        )
+    except (TypeError, ValueError):
+        pass
+    return result
+
+
+def _normalize_model_routing_config(settings: dict[str, Any]) -> dict[str, Any]:
+    result = _deep_merge(DEFAULT_MODEL_ROUTING_CONFIG, settings)
+    retry = result["retry"]
+    retry["enabled"] = bool(retry.get("enabled", True))
+    try:
+        retry["maxAttempts"] = min(max(int(retry.get("maxAttempts", 3)), 1), 5)
+    except (TypeError, ValueError):
+        retry["maxAttempts"] = 3
+    for key, default, minimum, maximum in (
+        ("baseDelayMs", 500, 0, 60_000),
+        ("maxDelayMs", 10_000, 0, 60_000),
+    ):
+        try:
+            retry[key] = min(max(int(retry.get(key, default)), minimum), maximum)
+        except (TypeError, ValueError):
+            retry[key] = default
+    try:
+        retry["multiplier"] = max(float(retry.get("multiplier", 2.0)), 1.0)
+    except (TypeError, ValueError):
+        retry["multiplier"] = 2.0
+    retry["honorRetryAfter"] = bool(retry.get("honorRetryAfter", True))
+
+    fallback = result["fallback"]
+    fallback["enabled"] = bool(fallback.get("enabled", False))
+    profiles = fallback.get("profiles")
+    fallback["profiles"] = [str(item) for item in profiles[:3] if str(item).strip()] if isinstance(profiles, list) else []
+    fallback["resetOnNextTurn"] = bool(fallback.get("resetOnNextTurn", True))
     return result
 
 

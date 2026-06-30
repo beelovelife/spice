@@ -50,6 +50,7 @@ from spice.llm.config import get_api_key, load_config
 from spice.llm.messages import Message
 from spice.llm.models import Model
 from spice.llm.model_registry import ModelRegistry, find_initial_model
+from spice.llm.routing import build_model_route
 from spice.llm.types import ModelRequestOptions
 from spice.sandbox.factory import create_environment, create_workspace_policy
 from spice.storage.factory import create_long_task_store, create_memory_store, create_session_store
@@ -164,6 +165,12 @@ class AgentSession:
             return
         self._ensure_session()
         options = self._request_options()
+        model_route = build_model_route(
+            self.model,
+            routing_settings=self.config.model_routing,
+            resolve_model=lambda profile: self.registry.find(None, profile),
+            options_factory=self._request_options_for_model,
+        )
         check_messages = [*self.messages, Message(role="user", content=text)]
         if self.compaction_status(check_messages).should_compact:
             try:
@@ -201,6 +208,8 @@ class AgentSession:
                 subagent_manager=self.subagent_manager if self.subagents_enabled else None,
                 session_label=self.session_label,
                 runtime_context=runtime_context,
+                model_route=model_route,
+                tools_settings=self.config.tools,
             ):
                 if isinstance(event, TurnEndEvent):
                     turn_text = event.text
@@ -451,11 +460,14 @@ class AgentSession:
         return self.session
 
     def _request_options(self) -> ModelRequestOptions:
+        return self._request_options_for_model(self.model)
+
+    def _request_options_for_model(self, model: Model) -> ModelRequestOptions:
         return ModelRequestOptions(
-            api_key=get_api_key(self.model.provider, env_names=self.model.api_key_envs),
-            temperature=self.config.temperature,
-            max_tokens=self.model.output_tokens,
-            base_url=self.config.base_url or self.model.base_url,
+            api_key=get_api_key(model.provider, env_names=model.api_key_envs),
+            temperature=model.temperature if model.temperature is not None else self.config.temperature,
+            max_tokens=model.output_tokens,
+            base_url=(self.config.base_url if model is self.model else None) or model.base_url,
         )
 
     def _build_system_message(self) -> Message:

@@ -12,6 +12,8 @@ from spice.agent.events import (
     AgentEvent,
     AgentStartEvent,
     AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -80,10 +82,28 @@ def _extension_event_payload(event: AgentEvent) -> tuple[str | None, dict[str, A
         return "text_delta", {"text": event.text}
     if isinstance(event, AssistantMessageEvent):
         return "assistant_message", {"text": event.text, "tool_calls": event.tool_calls}
+    if isinstance(event, ModelRetryEvent):
+        return "model_retry", {
+            "provider": event.provider,
+            "model": event.model,
+            "failed_attempt": event.failed_attempt,
+            "next_attempt": event.next_attempt,
+            "max_attempts": event.max_attempts,
+            "delay_seconds": event.delay_seconds,
+            "error": event.error,
+        }
+    if isinstance(event, ModelFallbackEvent):
+        return "model_fallback", {
+            "from_provider": event.from_provider,
+            "from_model": event.from_model,
+            "to_provider": event.to_provider,
+            "to_model": event.to_model,
+            "reason": event.reason,
+        }
     if isinstance(event, ToolExecutionStartEvent):
         return "tool_execution_start", {"tool_call_id": event.tool_call_id, "tool_name": event.tool_name, "args": event.args}
     if isinstance(event, ToolExecutionEndEvent):
         return "tool_execution_end", {"tool_call_id": event.tool_call_id, "tool_name": event.tool_name, "result": event.result}
     if isinstance(event, AgentErrorEvent):
-        return "agent_error", {"message": event.message}
+        return "agent_error", {"message": event.message, "kind": event.kind}
     return None, {}

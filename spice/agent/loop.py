@@ -10,8 +10,8 @@ from uuid import uuid4
 from spice.agent.debug_trace import (
     trace_round_end,
     trace_round_start,
-    trace_tool_end,
-    trace_tool_start,
+    trace_model_fallback,
+    trace_model_retry,
     trace_turn_end,
     trace_turn_start,
 )
@@ -19,21 +19,30 @@ from spice.agent.events import (
     AgentErrorEvent,
     AgentEvent,
     AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
-    ToolExecutionEndEvent,
-    ToolExecutionStartEvent,
     TurnEndEvent,
     TurnStartEvent,
 )
 from spice.agent.logging_config import get_logger
-from spice.agent.tool_results import build_tool_result_metadata
-from spice.extensions.manager import ExtensionEvent, ExtensionManager
+from spice.agent.tool_executor import ToolExecutionState, execute_tool_calls
+from spice.extensions.manager import ExtensionManager
 from spice.llm.messages import Message, ToolCall
 from spice.llm.models import Model
-from spice.llm.error_safety import public_exception_message
+from spice.llm.retry import ModelRetryPolicy
+from spice.llm.routing import ModelCandidate, ModelRoute
 from spice.llm.stream import stream_model
-from spice.llm.types import Done, StreamError, ModelRequestOptions, TextDelta, ToolCallEvent
-from spice.tools.base import ConfirmFn, Tool, ToolContext, tool_error
+from spice.llm.types import (
+    Done,
+    ModelFallbackNotice,
+    ModelRequestOptions,
+    ModelRetryNotice,
+    StreamError,
+    TextDelta,
+    ToolCallEvent,
+)
+from spice.tools.base import ConfirmFn, Tool
 from spice.tools.file_state import FileStateStore
 from spice.tools.tool_registry import ToolCallError, ToolRegistry
 from spice.sandbox.base import ExecutionEnvironment
@@ -60,6 +69,8 @@ async def run_turn(
     session_label: str | None = None,
     runtime_context: str | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
+    model_route: ModelRoute | None = None,
+    tools_settings: dict | None = None,
 ) -> AsyncIterator[AgentEvent]:
     logger.info(
         "turn_start model=%s/%s message_count=%d tool_count=%d cwd=%s",
@@ -79,6 +90,15 @@ async def run_turn(
         model_messages.insert(-1, Message(role="system", content=runtime_context.strip()))
     tool_registry = ToolRegistry(tools)
     schemas = tool_registry.schemas()
+    route = model_route or ModelRoute(
+        [ModelCandidate(model.profile_key or model.id, model, options)],
+        retry_policy=ModelRetryPolicy(enabled=False, max_attempts=1),
+        fallback_enabled=False,
+        stream_factory=stream_model,
+    )
+    tools_settings = tools_settings or {}
+    max_tool_concurrency = min(max(int(tools_settings.get("max_concurrency", 4)), 1), 16)
+    default_tool_timeout = max(float(tools_settings.get("default_timeout_seconds", 120)), 1.0)
     total_text_chars = 0
     total_tool_calls = 0
     rounds_run = 0
@@ -93,21 +113,56 @@ async def run_turn(
         tool_calls: list[ToolCall] = []
         finish_reason: str | None = None
 
-        async for event in stream_model(model, model_messages, schemas, options):
+        async for event in route.stream(model_messages, schemas):
             if isinstance(event, TextDelta):
                 text_parts.append(event.text)
                 yield TextDeltaEvent(event.text)
             elif isinstance(event, ToolCallEvent):
                 tool_calls.append(ToolCall(id=event.id or uuid4().hex[:8], name=event.name, arguments=event.arguments))
+            elif isinstance(event, ModelRetryNotice):
+                yield ModelRetryEvent(
+                    provider=event.provider,
+                    model=event.model,
+                    failed_attempt=event.failed_attempt,
+                    next_attempt=event.next_attempt,
+                    max_attempts=event.max_attempts,
+                    delay_seconds=event.delay_seconds,
+                    error=event.error,
+                )
+                trace_model_retry(
+                    provider=event.provider,
+                    model=event.model,
+                    attempt=event.next_attempt,
+                    max_attempts=event.max_attempts,
+                    delay_seconds=event.delay_seconds,
+                )
+            elif isinstance(event, ModelFallbackNotice):
+                yield ModelFallbackEvent(
+                    from_profile=event.from_profile,
+                    from_provider=event.from_provider,
+                    from_model=event.from_model,
+                    to_profile=event.to_profile,
+                    to_provider=event.to_provider,
+                    to_model=event.to_model,
+                    reason=event.reason,
+                    fallback_index=event.fallback_index,
+                    fallback_count=event.fallback_count,
+                )
+                trace_model_fallback(
+                    from_model=f"{event.from_provider}/{event.from_model}",
+                    to_model=f"{event.to_provider}/{event.to_model}",
+                    reason=event.reason,
+                )
             elif isinstance(event, StreamError):
                 logger.error("model_stream_error round=%d error=%s", round_index, event.error)
                 assistant_text = "".join(text_parts)
                 if assistant_text:
+                    failed_model = route.actual.model
                     assistant_message = Message(
                         role="assistant",
                         content=assistant_text,
-                        provider=model.provider,
-                        model=model.id,
+                        provider=failed_model.provider,
+                        model=failed_model.id,
                     )
                     messages.append(assistant_message)
                     model_messages.append(assistant_message)
@@ -138,12 +193,13 @@ async def run_turn(
             tool_calls=tool_calls,
             finish_reason=finish_reason,
         )
+        actual_model = route.actual.model
         assistant_message = Message(
             role="assistant",
             content=assistant_text,
             tool_calls=tool_calls,
-            provider=model.provider,
-            model=model.id,
+            provider=actual_model.provider,
+            model=actual_model.id,
         )
         messages.append(assistant_message)
         model_messages.append(assistant_message)
@@ -155,98 +211,36 @@ async def run_turn(
             yield TurnEndEvent(text=assistant_text, stop_reason=finish_reason or "stop")
             return
 
-        for call in tool_calls:
-            if extensions:
-                extension_event = await extensions.emit(
-                    "tool_call_start",
-                    ExtensionEvent(
-                        type="tool_call_start",
-                        data={"tool_name": call.name, "arguments": dict(call.arguments), "tool_call_id": call.id},
-                    ),
-                )
-                call.arguments = dict(extension_event.data.get("arguments") or call.arguments)
-                if extension_event.blocked:
-                    result = tool_error(extension_event.block_reason or f"Tool blocked by extension: {call.name}")
-                    trace_tool_start(round_index, call)
-                    trace_tool_end(round_index, call, result, duration_ms=0)
-                    blocked_message = Message(
-                        role="tool",
-                        content=result.content,
-                        tool_call_id=call.id,
-                        name=call.name,
-                        is_error=result.is_error,
-                        metadata=build_tool_result_metadata(call.name, call.arguments, result),
-                    )
-                    messages.append(blocked_message)
-                    model_messages.append(blocked_message)
-                    yield ToolExecutionStartEvent(tool_call_id=call.id, tool_name=call.name, args=call.arguments)
-                    yield ToolExecutionEndEvent(tool_call_id=call.id, tool_name=call.name, result=result)
-                    continue
-            yield ToolExecutionStartEvent(tool_call_id=call.id, tool_name=call.name, args=call.arguments)
-            tool_started = time.perf_counter()
-            logger.info("tool_start round=%d name=%s id=%s", round_index, call.name, call.id)
-            trace_tool_start(round_index, call)
-            plan = tool_registry.prepare_call(call.name, call.arguments)
-            if isinstance(plan, ToolCallError):
-                result = tool_error(plan.message, {"errors": plan.errors})
-            else:
-                tool = plan.tool
-                call.arguments = plan.arguments
-                if tool.requires_confirmation and confirm is None:
-                    result = tool_error(f"Tool requires confirmation but no confirmation callback is configured: {call.name}")
-                elif tool.requires_confirmation and not await confirm(tool.name, call.arguments):
-                    result = tool_error(f"Tool denied by user: {call.name}")
-                else:
-                    try:
-                        result = await tool.execute(
-                            call.arguments,
-                            ToolContext(
-                                cwd=cwd,
-                                workspace=workspace,
-                                environment=environment,
-                                confirm=confirm,
-                                file_states=file_states,
-                                subagent_manager=subagent_manager,
-                            ),
-                        )
-                    except Exception as exc:
-                        logger.exception("tool_exception round=%d name=%s id=%s", round_index, call.name, call.id)
-                        result = tool_error(public_exception_message(exc, prefix="Tool failed"))
-            tool_duration_ms = int((time.perf_counter() - tool_started) * 1000)
-            logger.info(
-                "tool_end round=%d name=%s id=%s is_error=%s duration_ms=%d content_chars=%d",
-                round_index,
-                call.name,
-                call.id,
-                result.is_error,
-                tool_duration_ms,
-                len(result.content),
+        execution_state = ToolExecutionState()
+        async for tool_event in execute_tool_calls(
+            round_index=round_index,
+            calls=tool_calls,
+            registry=tool_registry,
+            messages=messages,
+            model_messages=model_messages,
+            cwd=cwd,
+            workspace=workspace,
+            environment=environment,
+            confirm=confirm,
+            extensions=extensions,
+            file_states=file_states,
+            subagent_manager=subagent_manager,
+            max_concurrency=max_tool_concurrency,
+            default_timeout_seconds=default_tool_timeout,
+            state=execution_state,
+        ):
+            yield tool_event
+        if execution_state.fatal_result is not None:
+            message = execution_state.fatal_result.content
+            logger.error(
+                "turn_stopped fatal_tool=%s code=%s",
+                execution_state.fatal_tool_name,
+                execution_state.fatal_result.error_code,
             )
-            trace_tool_end(round_index, call, result, duration_ms=tool_duration_ms)
-            tool_message = Message(
-                role="tool",
-                content=result.content,
-                tool_call_id=call.id,
-                name=call.name,
-                is_error=result.is_error,
-                metadata=build_tool_result_metadata(call.name, call.arguments, result),
-            )
-            messages.append(tool_message)
-            model_messages.append(tool_message)
-            yield ToolExecutionEndEvent(tool_call_id=call.id, tool_name=call.name, result=result)
-            if extensions:
-                await extensions.emit(
-                    "tool_call_end",
-                    ExtensionEvent(
-                        type="tool_call_end",
-                        data={
-                            "tool_name": call.name,
-                            "arguments": dict(call.arguments),
-                            "tool_call_id": call.id,
-                            "result": result,
-                        },
-                    ),
-                )
+            trace_turn_end(rounds=round_index, text_chars=total_text_chars, tool_calls=total_tool_calls)
+            yield AgentErrorEvent(message, kind="fatal_tool")
+            yield TurnEndEvent(text=assistant_text, stop_reason="fatal_tool_error")
+            return
 
     logger.error("turn_stopped max_tool_rounds=%d", max_tool_rounds)
     trace_turn_end(rounds=rounds_run, text_chars=total_text_chars, tool_calls=total_tool_calls)

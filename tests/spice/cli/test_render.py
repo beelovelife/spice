@@ -11,6 +11,9 @@ from spice.agent.events import (
     AgentEndEvent,
     AgentStartEvent,
     AssistantMessageEvent,
+    AgentErrorEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -91,6 +94,20 @@ def test_renderer_ignores_agent_lifecycle_events() -> None:
     renderer.render_event(AgentEndEvent(session_id="session"))
 
     assert output.getvalue() == ""
+
+
+def test_renderer_shows_retry_fallback_and_fatal_tool_stop() -> None:
+    console, output = _console()
+    renderer = CliRenderer(console)
+
+    renderer.render_event(ModelRetryEvent("openai", "primary", 1, 2, 3, 0.5, "temporary"))
+    renderer.render_event(ModelFallbackEvent("primary", "openai", "primary", "backup", "anthropic", "backup", "server", 0, 1))
+    renderer.render_event(AgentErrorEvent("Tool denied by user: bash", kind="fatal_tool"))
+
+    rendered = output.getvalue()
+    assert "Retrying 2/3 in 0.5s" in rendered
+    assert "openai/primary -> anthropic/backup" in rendered
+    assert "Current turn stopped: Tool denied by user: bash" in rendered
 
 
 def test_markdown_renderer_streams_plain_text_before_turn_end() -> None:

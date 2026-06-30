@@ -20,6 +20,8 @@ def build_tool_result_metadata(tool_name: str, arguments: dict[str, Any], result
             "arguments": dict(arguments),
             "display": display,
             "is_error": result.is_error,
+            "disposition": result.disposition,
+            "error_code": result.error_code,
             "details": result.details,
             "truncated": False,
             "original_chars": len(result.content),

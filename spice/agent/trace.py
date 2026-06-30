@@ -15,6 +15,8 @@ from spice.agent.events import (
     AgentEvent,
     AgentStartEvent,
     AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -65,6 +67,10 @@ class RunTraceWriter:
                     "timestamp": _now(),
                 }
             )
+        elif isinstance(event, ModelRetryEvent):
+            self.events.append({"type": "model_retry", **asdict(event), "timestamp": _now()})
+        elif isinstance(event, ModelFallbackEvent):
+            self.events.append({"type": "model_fallback", **asdict(event), "timestamp": _now()})
         elif isinstance(event, ToolExecutionStartEvent):
             self.tool_calls += 1
             self.events.append(
@@ -100,7 +106,7 @@ class RunTraceWriter:
         elif isinstance(event, AgentErrorEvent):
             self.status = "error"
             self.error = event.message
-            self.events.append({"type": "agent_error", "message": event.message, "timestamp": _now()})
+            self.events.append({"type": "agent_error", "message": event.message, "kind": event.kind, "timestamp": _now()})
         elif isinstance(event, AgentEndEvent):
             if self.status != "error":
                 self.status = "completed"
@@ -179,6 +185,8 @@ def _tool_result_to_dict(result: ToolResult) -> dict[str, Any]:
         "content": result.content,
         "is_error": result.is_error,
         "details": _json_safe(result.details),
+        "disposition": result.disposition,
+        "error_code": result.error_code,
     }
 
 

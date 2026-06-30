@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from spice.agent.logging_config import get_logger
-from spice.llm.error_safety import public_exception_message
+from spice.llm.error_safety import stream_error_from_exception
 from spice.llm.messages import Message
 from spice.llm.models import Model
 from spice.llm.types import Done, StreamError, StreamEvent, ModelRequestOptions, TextDelta, ToolCallEvent, ToolSchema
@@ -25,12 +25,17 @@ class GeminiProvider:
         options: ModelRequestOptions,
     ) -> AsyncIterator[StreamEvent]:
         if not options.api_key:
-            yield StreamError("Missing Gemini API key. Set GEMINI_API_KEY or GOOGLE_API_KEY.")
+            yield StreamError(
+                "Missing Gemini API key. Set GEMINI_API_KEY or GOOGLE_API_KEY.",
+                kind="authentication",
+                provider=model.provider,
+                model=model.id,
+            )
             return
         try:
             from google import genai
         except ImportError:
-            yield StreamError("Package `google-genai` is not installed. Run `uv add google-genai`.")
+            yield StreamError("Package `google-genai` is not installed. Run `uv add google-genai`.", kind="unsupported")
             return
 
         started = time.perf_counter()
@@ -83,7 +88,12 @@ class GeminiProvider:
                 model.id,
                 int((time.perf_counter() - started) * 1000),
             )
-            yield StreamError(public_exception_message(exc, prefix="Provider request failed"))
+            yield stream_error_from_exception(
+                exc,
+                prefix="Provider request failed",
+                provider=model.provider,
+                model=model.id,
+            )
 
 
 def _messages_to_gemini(messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:

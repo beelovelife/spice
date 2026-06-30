@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
+
+from spice.llm.types import StreamError
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,39 @@ def public_exception(exc: BaseException) -> PublicError:
 def public_exception_message(exc: BaseException, *, prefix: str) -> str:
     error = public_exception(exc)
     return f"{prefix} ({error.category}): {error.message}"
+
+
+def stream_error_from_exception(exc: BaseException, *, prefix: str, provider: str, model: str) -> StreamError:
+    status = _status_code(exc)
+    category = classify_exception(exc)
+    if status in {401, 403}:
+        kind = "authentication"
+    elif status == 429:
+        kind = "rate_limit"
+    elif status == 408:
+        kind = "timeout"
+    elif status is not None and status >= 500:
+        kind = "server"
+    elif status is not None and 400 <= status < 500:
+        kind = "invalid_request"
+    else:
+        kind = {
+            "auth": "authentication",
+            "rate_limit": "rate_limit",
+            "service": "server",
+            "timeout": "timeout",
+            "network": "network",
+        }.get(category, "unknown")
+    retryable = kind in {"network", "timeout", "rate_limit", "server"} or status in {408, 429, 500, 502, 503, 504}
+    return StreamError(
+        public_exception_message(exc, prefix=prefix),
+        kind=kind,
+        retryable=retryable,
+        status_code=status,
+        retry_after_seconds=_retry_after_seconds(exc),
+        provider=provider,
+        model=model,
+    )
 
 
 def sanitize_error_text(text: str) -> str:
@@ -93,3 +130,27 @@ def _status_code(exc: BaseException) -> int | None:
     except (TypeError, ValueError):
         return None
     return status if 100 <= status <= 599 else None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or getattr(exc, "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            target = parsedate_to_datetime(str(value))
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            seconds = (target - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return min(seconds, 60.0) if seconds >= 0 else None

@@ -28,6 +28,8 @@ from spice.agent.events import (
     AgentEvent,
     AgentStartEvent,
     AssistantMessageEvent,
+    ModelFallbackEvent,
+    ModelRetryEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -165,6 +167,24 @@ class CliRenderer:
             if self._streaming:
                 self._finish_stream()
                 self._streaming = False
+        elif isinstance(event, ModelRetryEvent):
+            self._stop_waiting_indicator(clear=True)
+            self._finish_stream_before_block()
+            self.console.print(
+                "[yellow]Model request failed temporarily. "
+                f"Retrying {event.next_attempt}/{event.max_attempts} in {event.delay_seconds:.1f}s "
+                f"({event.provider}/{event.model}).[/yellow]"
+            )
+            self._start_waiting_indicator()
+        elif isinstance(event, ModelFallbackEvent):
+            self._stop_waiting_indicator(clear=True)
+            self._finish_stream_before_block()
+            self.console.print(
+                "[yellow]Model fallback:[/yellow] "
+                f"{event.from_provider}/{event.from_model} -> {event.to_provider}/{event.to_model} "
+                f"[dim](this turn, reason: {event.reason})[/dim]"
+            )
+            self._start_waiting_indicator()
         elif isinstance(event, ToolExecutionStartEvent):
             self._stop_waiting_indicator(clear=True)
             self._finish_stream_before_block()
@@ -203,7 +223,10 @@ class CliRenderer:
             if self._streaming:
                 self._finish_stream(blank_line=False)
                 self._streaming = False
-            self.console.print(f"[bold red]Error:[/bold red] {event.message}")
+            if event.kind == "fatal_tool":
+                self.console.print(f"[bold yellow]Current turn stopped:[/bold yellow] {event.message}")
+            else:
+                self.console.print(f"[bold red]Error:[/bold red] {event.message}")
             self._line_open = False
         elif isinstance(event, TurnEndEvent):
             self._stop_waiting_indicator(clear=True)

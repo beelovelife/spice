@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 class StreamEvent:
@@ -31,6 +31,46 @@ class Done(StreamEvent):
 @dataclass
 class StreamError(StreamEvent):
     error: str
+    kind: Literal[
+        "network",
+        "timeout",
+        "rate_limit",
+        "server",
+        "authentication",
+        "invalid_request",
+        "unsupported",
+        "cancelled",
+        "unknown",
+    ] = "unknown"
+    retryable: bool = False
+    status_code: int | None = None
+    retry_after_seconds: float | None = None
+    provider: str | None = None
+    model: str | None = None
+
+
+@dataclass
+class ModelRetryNotice(StreamEvent):
+    provider: str
+    model: str
+    failed_attempt: int
+    next_attempt: int
+    max_attempts: int
+    delay_seconds: float
+    error: str
+
+
+@dataclass
+class ModelFallbackNotice(StreamEvent):
+    from_profile: str
+    from_provider: str
+    from_model: str
+    to_profile: str
+    to_provider: str
+    to_model: str
+    reason: str
+    fallback_index: int
+    fallback_count: int
 
 
 @dataclass

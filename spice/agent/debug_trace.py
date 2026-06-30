@@ -54,6 +54,17 @@ def trace_round_start(round_index: int, *, message_count: int) -> None:
     write_trace(f"======== round {round_index} start messages={message_count} ========")
 
 
+def trace_model_retry(*, provider: str, model: str, attempt: int, max_attempts: int, delay_seconds: float) -> None:
+    write_trace(
+        f"---- model retry provider={provider} model={model} "
+        f"next_attempt={attempt}/{max_attempts} delay_seconds={delay_seconds:.3f} ----"
+    )
+
+
+def trace_model_fallback(*, from_model: str, to_model: str, reason: str) -> None:
+    write_trace(f"---- model fallback from={from_model} to={to_model} reason={reason} ----")
+
+
 def trace_round_end(
     round_index: int,
     *,
@@ -88,7 +99,8 @@ def trace_tool_end(round_index: int, call: ToolCall, result: ToolResult, *, dura
     preview = _truncate(content, _TOOL_RESULT_PREVIEW_CHARS)
     write_trace(
         f"[tool result] round={round_index} name={call.name} id={call.id} "
-        f"ok={not result.is_error} duration_ms={duration_ms} content_chars={len(content)}\n"
+        f"ok={not result.is_error} disposition={result.disposition} error_code={result.error_code or '<none>'} "
+        f"duration_ms={duration_ms} content_chars={len(content)}\n"
         f"{preview}\n"
         "[/tool result]\n"
         f"---- tool end round={round_index} name={call.name} id={call.id} ----\n"
