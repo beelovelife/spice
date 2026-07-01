@@ -62,6 +62,20 @@ source .venv/bin/activate
 spice --version
 ```
 
+#### 更新 Spice
+
+通过 `uv tool` 安装后，使用以下命令升级到最新版本：
+
+```bash
+uv tool upgrade spice
+```
+
+如果升级后仍未拉取到最新代码，可以绕过 uv 本地缓存，强制从 GitHub 重新安装：
+
+```bash
+uv tool install --force git+https://github.com/beelovelife/spice.git
+```
+
 ### 3. 配置 API Key
 
 首次使用可先配置 OpenAI 或 DeepSeek。Spice 优先读取环境变量，未命中时读取 `~/.spice/secrets.json`：
@@ -144,7 +158,11 @@ uv run spice run "你好，介绍一下自己"
 | `spice`                             | 进入交互式 CLI（默认入口）                          |
 | `spice chat`                        | 显式进入交互式 CLI                                  |
 | `spice tui`                         | 进入全屏 TUI                                        |
+| `spice chat --trace`                | 交互式 CLI，并记录本次启动的多轮 trace              |
+| `spice tui --trace`                 | 全屏 TUI，并记录本次启动的多轮 trace                |
 | `spice run "<prompt>"`              | 单次执行 prompt，stdout 保持脚本化                  |
+| `spice run "<prompt>" --trace`      | 单次执行并写入结构化 runtime trace                  |
+| `spice trace inspect <path.json>`    | 查看 trace 的步骤、工具结果、usage 和事件           |
 | `spice resume <session-id>`         | 按 id 恢复一个会话                                  |
 | `spice models`                      | 列出 provider/model 与当前配置、API key 状态        |
 | `spice logs [--tail N] [--path]`    | 查看 Spice 运行日志路径与最近日志                   |
@@ -170,9 +188,11 @@ uv run spice run "你好，介绍一下自己"
 | `spice config show`                 | 打印当前配置和 settings/secrets 路径                |
 | `spice config path`                 | 仅打印配置文件路径                                  |
 | `spice config get <key>`            | 读取某个配置项                                      |
-| `spice config set <key> <value>`    | 设置模型、密钥、trace、memory、日志保留期或 storage |
+| `spice config set <key> <value>`    | 设置模型、密钥、memory、日志保留期或 storage        |
 
-支持的配置键包括 `default-model`、`api-key`、`debug.trace`、`memory.enabled`、`logging.retention_days`、`storage.backend` 与 `storage.sqlitePath`。
+支持的配置键包括 `default-model`、`api-key`、`memory.enabled`、`logging.retention_days`、`storage.backend` 与 `storage.sqlitePath`。`--debug` 提升标准运行日志级别；`run --trace` 生成结构化运行轨迹。
+
+交互执行过程中，TUI 可用 `Esc` 或 `Ctrl+C` 取消当前模型/工具调用并继续会话；普通 CLI 可用 `Ctrl+C`。取消不会回滚工具已经产生的文件或外部副作用。
 
 ### Sandbox（`spice sandbox`）
 
@@ -326,6 +346,12 @@ uv run spice --debug
 - 优先覆盖**事件顺序、会话格式、provider 转换、工具执行、compaction、stdout 清洁度**等行为。
 - 不冻结实现细节，避免大段 mock。
 - TUI / CLI 共享逻辑应同时被两端的测试覆盖。
+
+---
+
+## 🔗 友链
+
+[LINUX DO - 新的理想型社区](https://linux.do/)
 
 ---
 
