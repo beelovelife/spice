@@ -11,13 +11,14 @@ Spice 强调架构边界清晰、运行链路可追踪、会话可恢复、工�
 ## ✨ 主要特性
 
 - **多 provider 支持**：内置 OpenAI、DeepSeek、Anthropic、Gemini 等模型，包括 Claude Haiku 4.5、Sonnet 4.6 与 Opus 4.8，统一通过模型注册表与 `~/.spice/settings.json` 管理。
-- **双前端体验**：`spice` / `spice chat` 走基于 `prompt_toolkit` 的交互式 CLI，`spice tui` 进入全屏 TUI；二者复用同一套 agent / session / 命令 / 补全语义。
+- **双前端体验**：`spice` / `spice chat` 走基于 `prompt_toolkit` 的交互式 CLI，`spice tui` 进入全屏 TUI；二者复用同一套 agent、session 服务和 command registry。
 - **流式 agent loop**：明确的 `prompt → turn_start → assistant stream → tool calls → tool results → turn_end → agent_end` 事件流，UI、会话持久化、trace 都挂在事件上。
 - **受控工具体系**：内置 `file`、`bash`、`web`、`skill`、`memory`、`subagent` 等工具集合，统一 schema / 执行 / 错误结构，支持 read-only 模式与确认门。
-- **会话持久化与树状分支**：默认使用可读的 JSONL 文件，也可切换 SQLite；支持 `resume`、`rewind`、`fork`、`prune`、`workspaces` 等管理命令。
+- **会话持久化与树状历史**：默认使用可读的 JSONL 文件，也可切换 SQLite；支持 `resume`、`rewind`、`prune`、`workspaces` 等管理命令。
 - **受控执行环境**：默认在本机 workspace 策略下执行，也可使用 Docker sandbox 隔离命令运行。
 - **上下文压缩**：手动 `/compact` 与自动 compaction，配合可序列化上下文与摘要原因。
 - **Skills 与 Extensions**：`~/.spice/skills/` 沉淀工作流，`~/.spice/extensions/*.py` 提供可信本地扩展，能注册工具、slash command 与 hook。
+- **MCP 客户端**：通过 stdio 或 Streamable HTTP 连接 MCP Server，将发现的工具接入统一 Tool、确认、trace 与超时链路。
 - **长任务与子代理**：内置 long task 状态机和 `spawn_subagents` 工具，可在主 agent 中分发子任务。
 - **诊断友好**：`spice logs`、`spice config`、`spice skills doctor`、`spice memory status` 等命令把运行状态与配置完全可视化。
 
@@ -188,9 +189,18 @@ uv run spice run "你好，介绍一下自己"
 | `spice config show`                 | 打印当前配置和 settings/secrets 路径                |
 | `spice config path`                 | 仅打印配置文件路径                                  |
 | `spice config get <key>`            | 读取某个配置项                                      |
-| `spice config set <key> <value>`    | 设置模型、密钥、memory、日志保留期或 storage        |
+| `spice config set <key> <value>`    | 设置模型、密钥、memory、storage、工具运行参数和模型路由 |
 
-支持的配置键包括 `default-model`、`api-key`、`memory.enabled`、`logging.retention_days`、`storage.backend` 与 `storage.sqlitePath`。`--debug` 提升标准运行日志级别；`run --trace` 生成结构化运行轨迹。
+支持的配置键包括：
+
+- `default-model`、`api-key`
+- `memory.enabled`、`logging.retention_days`
+- `storage.backend`、`storage.sqlitePath`
+- `tools.max_concurrency`、`tools.default_timeout_seconds`
+- `modelRouting.retry.enabled`、`modelRouting.retry.maxAttempts`
+- `modelRouting.fallback.enabled`、`modelRouting.fallback.profiles`
+
+`--debug` 提升标准运行日志级别；`run --trace` 生成结构化运行轨迹。
 
 交互执行过程中，TUI 可用 `Esc` 或 `Ctrl+C` 取消当前模型/工具调用并继续会话；普通 CLI 可用 `Ctrl+C`。取消不会回滚工具已经产生的文件或外部副作用。
 
@@ -221,6 +231,40 @@ spice storage init
 | `spice skills view <name> [-f file]`    | 查看 SKILL.md 或 skill 目录下的某个文件             |
 | `spice skills doctor`                   | 显示 skill 加载诊断（冲突、解析失败等）             |
 
+### MCP（`spice mcp`）
+
+Spice 从 `~/.spice/settings.json` 的 `mcpServers` 读取全局服务器，并兼容项目级 `.mcp.json`。项目配置的 stdio 命令首次启动前会请求信任确认。
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": {"Authorization": "Bearer ${REMOTE_MCP_TOKEN}"}
+    }
+  }
+}
+```
+
+密钥应放在环境变量或 `~/.spice/secrets.json`，配置中通过 `${VAR}` 引用。
+
+| 命令 | 说明 |
+|---|---|
+| `spice mcp list` | 列出合并后的 MCP 配置 |
+| `spice mcp add <name> --command ... --arg ...` | 添加全局 stdio Server |
+| `spice mcp add <name> --url ...` | 添加全局 Streamable HTTP Server |
+| `spice mcp test <name>` | 连接并检查 Server |
+| `spice mcp tools <name>` | 查看发现的工具及确认策略 |
+| `spice mcp enable\|disable <name>` | 启用或禁用全局 Server |
+| `spice mcp remove <name>` | 删除全局 Server |
+| `spice mcp trust <name>` | 信任当前项目的 stdio Server 配置 |
+
+交互模式使用 `/mcp` 查看连接状态，使用 `/mcp reload` 重载配置和工具。
+
 ### 长期记忆（`spice memory`）
 
 | 子命令                  | 说明                                                |
@@ -247,9 +291,12 @@ spice storage init
 | `/history [--tree|--raw]` | 查看当前会话历史                              |
 | `/rewind <entry-id>`| 把当前 leaf 指针移到某个 entry                      |
 | `/tools`            | 查看内置工具与启用状态                              |
+| `/mcp [reload]`     | 查看 MCP 连接状态，或重载服务器和工具               |
 | `/settings`         | 当前交互设置（模型、reasoning、工具开关、输出模式） |
+| `/cost`、`/usage`   | 查看当前会话的 token usage 与预估费用               |
 | `/subagent [on|off|status]` | 控制子代理工具开关                          |
 | `/compact [status|focus]`  | 手动压缩上下文                              |
+| `/memory [project|global|all|status|show ...]` | 萃取或查看长期记忆       |
 | `/plan [task|execute|cancel]` | 进入只读 plan 模式或规划任务             |
 | `/task <objective|status|cancel|complete>` | 长任务管理                     |
 | `/goal <objective|status|cancel|complete>` | 长期目标管理                   |
@@ -258,7 +305,7 @@ spice storage init
 | `/help`             | 显示所有 slash command                              |
 | `/quit`             | 退出                                                |
 
-CLI 与 TUI 共享同一套 command registry，business logic 不在输入循环里硬编码。
+CLI 与 TUI 复用 command registry 和会话服务；少量界面相关的选择与渲染逻辑由各自前端实现。
 
 ---
 
@@ -282,11 +329,11 @@ CLI 与 TUI 共享同一套 command registry，business logic 不在输入循环
 
 ## 🪄 Skills
 
-Skill 是 Markdown 描述的复用工作流，按以下顺序加载并去重：
+Skill 是 Markdown 描述的复用工作流。Spice 从以下位置加载 `<name>/SKILL.md`，同名时后列来源覆盖前列来源：
 
-1. 用户级：`~/.spice/skills/<name>/SKILL.md` 或 `~/.spice/skills/<name>.md`
-2. 项目级：`<cwd>/.spice/skills/...`
-3. 显式路径：通过 `--skill-path` 或 API 提供
+1. 用户级：`~/.spice/skills/<name>/SKILL.md`
+2. 项目级：从当前目录向上查找最近的 `.spice/skills/<name>/SKILL.md`
+3. 显式路径：通过 `--skill-path` 或 API 提供的 skill 文件/目录
 
 每个 skill 支持 `description`、`triggers`、`always` 等 frontmatter，可被模型通过 `skills_list` / `skill_view` 工具检索查看，或通过 `/skill:<name>` 直接触发。
 
@@ -294,14 +341,14 @@ Skill 是 Markdown 描述的复用工作流，按以下顺序加载并去重：
 
 ## 🔌 Extensions
 
-第一版 extension 走可信本地 Python 代码，扫描路径：
+Extension 使用可信本地 Python 代码，扫描路径：
 
 - `~/.spice/extensions/*.py`
 - `~/.spice/extensions/<name>/{__init__.py,extension.py,main.py,index.py}`
 
 Extension 入口暴露 `extension(api)` / `activate(api)` / `default(api)`，可：
 
-- `api.tool(...)` 注册模型可调用工具
+- `@api.tool(...)` 装饰函数并注册模型可调用工具（参数 schema 可从类型注解推导，也可显式传入）
 - `api.command(...)` 注册 slash command
 - `api.on(...)` 注册 hook（`input`、`tool_call_start`、`tool_call_end` 等）
 
@@ -318,7 +365,10 @@ spice/
 ├── extensions/   本地 Python 扩展加载与 hook 分发
 ├── llm/          provider、模型注册、消息转换、streaming
 │   └── providers/  openai / anthropic / gemini 等具体实现
+├── mcp/          MCP 配置、连接管理、工具适配与项目信任
+├── sandbox/      local / workspace / Docker 执行环境与策略
 ├── skills/       skill 加载与读取
+├── storage/      文件与 SQLite 应用状态存储
 ├── tools/        工具 base、registry 与 file/bash/web/memory/subagent/skill 实现
 └── tui/          基于 prompt_toolkit 的全屏 TUI
 tests/            行为与回归测试
