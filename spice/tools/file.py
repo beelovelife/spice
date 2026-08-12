@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import difflib
 import os
+import tempfile
 from pathlib import Path
 
 from spice.sandbox.factory import create_workspace_policy
 from spice.sandbox.policy import WorkspacePolicy
-from spice.tools.base import FatalToolError, Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head
+from spice.tools.base import FatalToolError, Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head_tail
 
 
 async def list_dir(args: dict, context: ToolContext) -> ToolResult:
@@ -109,12 +110,14 @@ async def write_file(args: dict, context: ToolContext) -> ToolResult:
 async def edit_file(args: dict, context: ToolContext) -> ToolResult:
     old = str(args.get("old_text") or "")
     new = str(args.get("new_text") or "")
+    raw_path = str(args.get("path") or "")
     occurrence = args.get("occurrence")
     dry_run = bool(args.get("dry_run") or False)
     if not old:
         return tool_error("old_text is required.")
+    workspace = _workspace(context)
     try:
-        path = _workspace(context).resolve_write(str(args.get("path") or ""), content_size=len(new.encode("utf-8")))
+        path = workspace.resolve_write(raw_path, content_size=0)
     except PermissionError as exc:
         return fatal_tool_error(str(exc), code="workspace_policy_denied")
     if not path.exists():
@@ -139,6 +142,10 @@ async def edit_file(args: dict, context: ToolContext) -> ToolResult:
         updated = _replace_nth(content, old, new, occurrence_index)
     else:
         updated = content.replace(old, new, 1)
+    try:
+        workspace.resolve_write(raw_path, content_size=len(updated.encode("utf-8")))
+    except PermissionError as exc:
+        return fatal_tool_error(str(exc), code="workspace_policy_denied")
     diff = "".join(
         difflib.unified_diff(
             content.splitlines(keepends=True),
@@ -148,12 +155,13 @@ async def edit_file(args: dict, context: ToolContext) -> ToolResult:
         )
     )
     details = {"path": str(path), "dry_run": dry_run, **_diff_stats(diff)}
+    preview = truncate_head_tail(diff, 8000)
     if dry_run:
-        return tool_result(truncate_head(diff, 8000) or "No changes.", details)
+        return tool_result(preview or "No changes.", details, full_content=diff if preview != diff else None)
     path.write_text(updated, encoding="utf-8")
     if context.file_states:
         context.file_states.note_write(path)
-    return tool_result(truncate_head(diff, 8000) or f"Edited {path}", details)
+    return tool_result(preview or f"Edited {path}", details, full_content=diff if preview != diff else None)
 
 
 async def apply_patch(args: dict, context: ToolContext) -> ToolResult:
@@ -180,6 +188,15 @@ async def apply_patch(args: dict, context: ToolContext) -> ToolResult:
     if errors:
         return tool_error("Patch validation failed:\n" + "\n".join(f"- {error}" for error in errors))
 
+    workspace = _workspace(context)
+    for path, after in after_by_path.items():
+        if after is None:
+            continue
+        try:
+            workspace.resolve_write(str(path), content_size=len(after.encode("utf-8")))
+        except PermissionError as exc:
+            return fatal_tool_error(str(exc), code="workspace_policy_denied")
+
     diff = _multi_file_diff(before_by_path, after_by_path)
     details = {
         "dry_run": dry_run,
@@ -187,23 +204,82 @@ async def apply_patch(args: dict, context: ToolContext) -> ToolResult:
         "operations": len(operations),
         **_diff_stats(diff),
     }
+    preview = truncate_head_tail(diff, 12000)
     if dry_run:
-        return tool_result(truncate_head(diff, 12000) or "No changes.", details)
+        return tool_result(preview or "No changes.", details, full_content=diff if preview != diff else None)
 
-    written: list[Path] = []
+    error = _commit_patch(before_by_path, after_by_path)
+    if error is not None:
+        return tool_error(error, code="patch_commit_failed")
+    if context.file_states:
+        for path in after_by_path:
+            context.file_states.note_write(path)
+    return tool_result(
+        preview or f"Applied patch to {len(after_by_path)} file(s).",
+        details,
+        full_content=diff if preview != diff else None,
+    )
+
+
+def _commit_patch(before_by_path: dict[Path, str | None], after_by_path: dict[Path, str | None]) -> str | None:
+    staged: dict[Path, Path] = {}
+    committed: list[Path] = []
     try:
         for path, after in after_by_path.items():
             if after is None:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+            temp_path = Path(temp_name)
+            staged[path] = temp_path
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(after)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_path, path.stat().st_mode if path.exists() else 0o644)
+
+        for path in sorted(after_by_path, key=lambda item: str(item)):
+            after = after_by_path[path]
+            if after is None:
                 path.unlink()
             else:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(after, encoding="utf-8")
-            written.append(path)
-            if context.file_states:
-                context.file_states.note_write(path)
+                os.replace(staged.pop(path), path)
+            committed.append(path)
     except OSError as exc:
-        return tool_error(f"Patch write failed after updating {len(written)} file(s): {exc}")
-    return tool_result(truncate_head(diff, 12000) or f"Applied patch to {len(after_by_path)} file(s).", details)
+        rollback_errors = _rollback_patch(committed, before_by_path)
+        suffix = f" Rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else " Changes were rolled back."
+        return f"Patch commit failed after updating {len(committed)} file(s): {exc}.{suffix}"
+    finally:
+        for temp_path in staged.values():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+    return None
+
+
+def _rollback_patch(committed: list[Path], before_by_path: dict[Path, str | None]) -> list[str]:
+    errors: list[str] = []
+    for path in reversed(committed):
+        before = before_by_path.get(path)
+        try:
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".rollback", dir=str(path.parent))
+                temp_path = Path(temp_name)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(before)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp_path, path)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    return errors
 
 
 def _plan_patch_operation(
@@ -484,10 +560,12 @@ async def search_files(args: dict, context: ToolContext) -> ToolResult:
                     matched_files.add(file_path)
                     if len(matches) >= MAX_SEARCH_MATCHES:
                         truncated = True
-                        content = truncate_head("\n".join(matches))
+                        full_content = "\n".join(matches)
+                        content = truncate_head_tail(full_content)
                         return tool_result(
                             content,
                             {"match_count": len(matches), "file_count": len(matched_files), "truncated": truncated},
+                            full_content=full_content if content != full_content else None,
                         )
     return tool_result(
         "\n".join(matches) if matches else "No matches.",

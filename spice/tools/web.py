@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from tavily import AsyncTavilyClient
 
 from spice.llm.config import get_api_key
 from spice.llm.error_safety import public_exception_message
-from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result, truncate_head
+from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result, truncate_head_tail
 
 
 async def web_search(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -44,7 +43,13 @@ async def web_search(args: dict[str, Any], context: ToolContext) -> ToolResult:
         url = item.get("url") or ""
         content = item.get("content") or ""
         blocks.append(f"{title}\n{url}\n{content}".strip())
-    return tool_result(truncate_head("\n\n".join(blocks) or "(no results)", 12000), {"raw": response})
+    content = "\n\n".join(blocks) or "(no results)"
+    preview = truncate_head_tail(content, 12000)
+    return tool_result(
+        preview,
+        {"result_count": len(blocks), "output_truncated": preview != content},
+        full_content=content if preview != content else None,
+    )
 
 
 def create_web_tools() -> list[Tool]:
