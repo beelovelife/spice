@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from spice.agent.subagent import MAX_CONCURRENT_SUBAGENTS, SubagentTask
-from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_result
+from spice.tools.base import Tool, ToolContext, ToolResult, tool_error
 
 
 def create_subagent_tool() -> Tool:

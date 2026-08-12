@@ -134,6 +134,39 @@ def test_tui_turn_gap_keeps_rounds_from_touching() -> None:
     assert tui._message_buffer.text == "Spice: previous answer\n\nYou: next question\n"
 
 
+def test_tui_activity_status_distinguishes_generation_pause_and_tool(monkeypatch) -> None:
+    tui = _minimal_tui()
+    tui._agent_session = None
+    tui._busy = True
+    tui._activity_started = 100.0
+    tui._streaming = True
+    tui._last_stream_delta_at = 104.5
+    tui._active_tool_name = None
+    monkeypatch.setattr("spice.tui.app.time.monotonic", lambda: 105.0)
+
+    assert "".join(text for _, text in tui._mode_fragments()) == " ▌ Generating · 5s"
+
+    tui._last_stream_delta_at = 102.0
+    assert "".join(text for _, text in tui._mode_fragments()) == " ▌ Waiting for model · 5s"
+
+    tui._active_tool_name = "web_search"
+    assert "".join(text for _, text in tui._mode_fragments()) == " ▌ Running web_search · 5s"
+
+
+def test_tui_styles_role_labels_and_tool_rows_without_changing_text() -> None:
+    tui = _minimal_tui()
+    original = "You: question\n\nSpice: answer\n  tool: web_search()\n  web_search -> done"
+    tui._append(original)
+
+    fragments = tui._message_fragments()
+
+    assert "".join(text for _, text in fragments) == original
+    assert ("class:message.user-label", "You:") in fragments
+    assert ("class:message.assistant-label", "Spice:") in fragments
+    assert any(style == "class:message.tool" and "tool: web_search" in text for style, text in fragments)
+    assert any(style == "class:message.tool-result" and "web_search -> done" in text for style, text in fragments)
+
+
 def test_tui_markdown_lists_are_compact() -> None:
     tui = _minimal_tui()
 
@@ -161,6 +194,24 @@ def test_tui_markdown_heading_gets_breathing_room() -> None:
     rendered = tui._render_markdown_text("## 标题\n正文")
 
     assert rendered == "标题\n\n正文\n"
+
+
+def test_tui_compact_uses_agent_session_engine() -> None:
+    async def exercise() -> None:
+        tui = _minimal_tui()
+        calls = []
+
+        async def compact(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(tokens_before=100, tokens_after=40)
+
+        tui._agent_session = SimpleNamespace(session=SimpleNamespace(id="session-1"), compact=compact)
+        await tui._show_compact("focus on tests")
+
+        assert calls == [{"focus": "focus on tests", "reason": "manual", "force": True}]
+        assert "~100 -> ~40 tokens" in tui._message_buffer.text
+
+    asyncio.run(exercise())
 
 
 def test_tui_scrolls_message_history_off_tail() -> None:
@@ -296,6 +347,8 @@ def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monk
     assert "old conversation" not in tui._message_buffer.text
     assert "latest answer" in tui._message_buffer.text
     assert tui._message_follow_tail is True
+
+
     assert tui._message_vertical_scroll == tui._message_bottom_scroll()
     assert tui._message_vertical_scroll > 0
 
@@ -306,6 +359,74 @@ def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monk
     tui._scroll_messages(3)
     assert tui._message_vertical_scroll == bottom
     assert tui._message_follow_tail is True
+
+
+def test_shared_resume_replaces_view_replays_history_and_resets_policy(monkeypatch) -> None:
+    async def exercise() -> None:
+        tui = SpiceTUI()
+        tui._append("old conversation\n")
+        tui.confirm_policy.allow_file_edits = True
+        closed = []
+
+        class OldSession:
+            extensions = None
+            model = SimpleNamespace(provider="openai", id="old")
+
+            async def aclose(self) -> None:
+                closed.append(True)
+
+        new_session = SimpleNamespace(
+            session_id="session-new",
+            session_label="session-new",
+            runtime_model_label="openai/new",
+            messages=[
+                SimpleNamespace(role="user", content="restored question", tool_calls=None),
+                SimpleNamespace(role="assistant", content="restored answer", tool_calls=None),
+            ],
+            confirm=None,
+        )
+
+        monkeypatch.setattr("spice.interactive.commands.replace_session", lambda *_args, **_kwargs: new_session)
+        tui._agent_session = OldSession()
+        tui._bind_trace_session = lambda: None
+        tui._refresh_completer = lambda: None
+
+        await tui._handle_slash_command("/resume session-new")
+
+        assert "old conversation" not in tui._message_buffer.text
+        assert "restored question" in tui._message_buffer.text
+        assert "restored answer" in tui._message_buffer.text
+        assert tui.confirm_policy.allow_file_edits is False
+        assert closed == [True]
+
+    asyncio.run(exercise())
+
+
+def test_shared_reset_clears_old_view_before_painting_result() -> None:
+    async def exercise() -> None:
+        tui = SpiceTUI()
+        tui._append("old conversation\n")
+
+        class Session:
+            session = object()
+            session_id = "session-1"
+            extensions = None
+
+            def reset(self) -> None:
+                return None
+
+        async def confirm(_request) -> str:
+            return "yes"
+
+        tui._agent_session = Session()
+        tui._port_confirm = confirm
+
+        await tui._handle_slash_command("/reset")
+
+        assert "old conversation" not in tui._message_buffer.text
+        assert "Reset session: session-1" in tui._message_buffer.text
+
+    asyncio.run(exercise())
 
 
 def test_tui_submitting_message_leaves_history_mode_and_follows_response() -> None:
@@ -336,7 +457,7 @@ def test_tui_submitting_message_leaves_history_mode_and_follows_response() -> No
         assert prompts == ["new question"]
         assert tui._message_follow_tail is True
         assert tui._message_vertical_scroll == tui._message_bottom_scroll()
-        assert tui._message_buffer.text.endswith("You: new question\n")
+        assert tui._message_buffer.text.endswith("You: new question\n\n")
 
         tui._render_event(TurnStartEvent(prompt="new question"))
         tui._render_event(TextDeltaEvent("visible response"))

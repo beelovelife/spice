@@ -12,10 +12,12 @@ from spice.tools.base import Tool, ToolContext, ToolResult, tool_error, tool_res
 
 async def memory(args: dict[str, Any], context: ToolContext) -> ToolResult:
     action = str(args.get("action") or "read")
-    target = str(args.get("target") or "memory")
+    target = str(args.get("target") or "global")
+    if target == "global":
+        target = "memory"
     content = str(args.get("content") or "")
     old = str(args.get("old") or args.get("old_text") or "")
-    store = create_memory_store(load_config())
+    store = create_memory_store(load_config(), workspace=context.cwd)
     try:
         if action == "read":
             result = store.read(target)
@@ -41,7 +43,8 @@ def create_memory_tools() -> list[Tool]:
             description=(
                 "Read or update persistent long-term memory only when memory is enabled. "
                 "Use target=user for stable user preferences, profile, communication style, and workflow habits. "
-                "Use target=memory for durable project, environment, command, architecture, or debugging facts. "
+                "Choose exactly one target for each atomic fact. Use target=global for cross-project environment facts and reusable operational knowledge. "
+                "Use target=project for commands, conventions, architecture decisions, and debugging facts specific to the current workspace. "
                 "Do not save secrets, API keys, raw logs, stack traces, temporary task progress, guesses, or facts easily rediscovered from files. "
                 "Use action=read before replace/remove when you need the exact existing entry; replace/remove require a unique substring in old/old_text."
             ),
@@ -49,11 +52,12 @@ def create_memory_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["read", "add", "replace", "remove"]},
-                    "target": {"type": "string", "enum": ["user", "memory"]},
+                    "target": {"type": "string", "enum": ["user", "global", "project"]},
                     "content": {"type": "string"},
                     "old": {"type": "string"},
                     "old_text": {"type": "string"},
                 },
+                "required": ["action", "target"],
                 "additionalProperties": False,
             },
             execute=memory,

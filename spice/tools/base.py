@@ -26,6 +26,7 @@ class ToolResult:
     details: dict[str, Any] = field(default_factory=dict)
     disposition: ToolFailureDisposition = "recoverable"
     error_code: str | None = None
+    full_content: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -256,8 +257,13 @@ def _matches_json_type(value: Any, expected: str | list[str]) -> bool:
     return False
 
 
-def tool_result(content: str, details: dict[str, Any] | None = None) -> ToolResult:
-    return ToolResult(content=content, details=details or {})
+def tool_result(
+    content: str,
+    details: dict[str, Any] | None = None,
+    *,
+    full_content: str | None = None,
+) -> ToolResult:
+    return ToolResult(content=content, details=details or {}, full_content=full_content)
 
 
 def tool_error(
@@ -265,8 +271,9 @@ def tool_error(
     details: dict[str, Any] | None = None,
     *,
     code: str | None = None,
+    full_content: str | None = None,
 ) -> ToolResult:
-    return ToolResult(content=content, is_error=True, details=details or {}, error_code=code)
+    return ToolResult(content=content, is_error=True, details=details or {}, error_code=code, full_content=full_content)
 
 
 def fatal_tool_error(
@@ -294,6 +301,22 @@ def truncate_tail(text: str, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
     return f"[truncated: kept last {limit} characters]\n\n" + text[-limit:]
+
+
+def truncate_head_tail(text: str, limit: int = 12000) -> str:
+    """Keep both ends of oversized text so terminal errors at the tail survive."""
+    if len(text) <= limit:
+        return text
+    limit = max(int(limit), 0)
+    head_chars = (limit + 1) // 2
+    tail_chars = limit // 2
+    omitted = len(text) - head_chars - tail_chars
+    marker = (
+        f"\n\n[truncated: omitted {omitted} characters; "
+        f"kept first {head_chars} and last {tail_chars} characters]\n\n"
+    )
+    tail = text[-tail_chars:] if tail_chars else ""
+    return text[:head_chars] + marker + tail
 
 
 def workspace_path(cwd: Path, raw_path: str) -> Path:

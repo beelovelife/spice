@@ -111,8 +111,8 @@ def test_cli_debug_option_configures_logging_before_command(tmp_path, monkeypatc
         logger.removeHandler(handler)
     monkeypatch.setattr(logging_config, "_CONFIGURED", False)
     monkeypatch.setattr(logging_config, "_LOG_PATH", None)
-    debug_path = tmp_path / "cli.debug.log"
-    monkeypatch.setattr(logging_config, "DEBUG_LOG_PATH", debug_path)
+    debug_path = tmp_path / "spice.log"
+    monkeypatch.setattr(logging_config, "LOG_PATH", debug_path)
     monkeypatch.setattr(cli_main, "set_process_title", lambda: None)
 
     try:

@@ -67,16 +67,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.model, "gpt-5.1")
             self.assertEqual(config.temperature, 0.2)
 
-    def test_load_config_reads_debug_trace_setting(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            settings_path = Path(directory) / "settings.json"
-            settings_path.write_text(json.dumps({"debug": {"trace": True}}), encoding="utf-8")
-
-            with patch.object(config_module, "CONFIG_DIR", Path(directory)), patch.object(config_module, "SETTINGS_PATH", settings_path):
-                config = load_config()
-
-            self.assertTrue(config.debug_trace)
-
     def test_load_config_reads_memory_enabled_setting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings_path = Path(directory) / "settings.json"
@@ -86,6 +76,21 @@ class ConfigTests(unittest.TestCase):
                 config = load_config()
 
             self.assertTrue(config.memory_enabled)
+
+    def test_load_config_reads_memory_scope_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps({"memory": {"userCharLimit": 1000, "globalCharLimit": 2000, "projectCharLimit": 7000}}),
+                encoding="utf-8",
+            )
+
+            with patch.object(config_module, "CONFIG_DIR", Path(directory)), patch.object(config_module, "SETTINGS_PATH", settings_path):
+                config = load_config()
+
+            self.assertEqual(config.memory_user_char_limit, 1000)
+            self.assertEqual(config.memory_global_char_limit, 2000)
+            self.assertEqual(config.memory_project_char_limit, 7000)
 
     def test_load_config_reads_storage_setting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -206,7 +211,6 @@ class ConfigTests(unittest.TestCase):
                                 "temperature": 0.1,
                             }
                         },
-                        debug_trace=True,
                         memory_enabled=True,
                         logging_retention_days=14,
                     )
@@ -214,8 +218,11 @@ class ConfigTests(unittest.TestCase):
 
             data = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(data["defaultModel"], "local-qwen")
-            self.assertEqual(data["debug"], {"trace": True})
-            self.assertEqual(data["memory"], {"enabled": True})
+            self.assertNotIn("debug", data)
+            self.assertEqual(
+                data["memory"],
+                {"enabled": True, "userCharLimit": 1500, "globalCharLimit": 3000, "projectCharLimit": 3000},
+            )
             self.assertEqual(data["logging"], {"retention_days": 14})
             self.assertNotIn("model", data)
             self.assertNotIn("providers", data)
@@ -231,6 +238,29 @@ class ConfigTests(unittest.TestCase):
                     "temperature": 0.1,
                 },
             )
+
+    def test_save_config_preserves_settings_owned_by_other_subsystems(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {"filesystem": {"command": "server"}},
+                        "providers": {"local": {"baseUrl": "http://localhost:1234/v1"}},
+                        "extensionSetting": {"enabled": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(config_module, "CONFIG_DIR", Path(directory)), patch.object(config_module, "SETTINGS_PATH", settings_path):
+                save_config(SpiceConfig(memory_enabled=True))
+
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["mcpServers"], {"filesystem": {"command": "server"}})
+            self.assertEqual(data["providers"], {"local": {"baseUrl": "http://localhost:1234/v1"}})
+            self.assertEqual(data["extensionSetting"], {"enabled": True})
+            self.assertTrue(data["memory"]["enabled"])
 
     def test_get_api_key_reads_secret_by_env_name_before_provider_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -6,6 +6,7 @@ import pytest
 
 from spice.tools.base import ToolContext
 from spice.tools.bash import bash, create_bash_tools
+from spice.sandbox.base import ExecResult
 
 
 def test_create_bash_tools_registers_confirmed_shell_tool() -> None:
@@ -45,6 +46,27 @@ def test_bash_reports_nonzero_exit_as_error(tmp_path) -> None:
     assert result.details["exit_code"] == 7
 
 
+def test_bash_keeps_full_output_only_for_artifact(tmp_path) -> None:
+    output = "start" + "x" * 13_000 + "final error"
+
+    class FakeEnvironment:
+        async def run(self, command, *, cwd, timeout, env=None):
+            return ExecResult(output=output, stdout=output, stderr="", exit_code=1, details={"environment": "fake"})
+
+    result = asyncio.run(
+        bash(
+            {"command": "fake", "timeout": 5},
+            ToolContext(cwd=tmp_path, environment=FakeEnvironment()),
+        )
+    )
+
+    assert result.content.startswith("start")
+    assert result.content.endswith("final error")
+    assert result.full_content == output
+    assert "stdout" not in result.details
+    assert result.details["output_truncated"] is True
+
+
 def test_bash_rejects_empty_command(tmp_path) -> None:
     result = asyncio.run(bash({"command": ""}, ToolContext(cwd=tmp_path)))
 
@@ -74,7 +96,7 @@ def test_bash_kills_process_group_on_cancellation(tmp_path, monkeypatch) -> None
         killed.append((pid, sig))
 
     monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
-    monkeypatch.setattr("spice.tools.bash.os.killpg", fake_killpg)
+    monkeypatch.setattr("spice.sandbox.local.os.killpg", fake_killpg)
 
     async def run_and_cancel() -> None:
         task = asyncio.create_task(bash({"command": "sleep 60", "timeout": 30}, ToolContext(cwd=tmp_path)))

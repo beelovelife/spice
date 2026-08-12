@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio  # Re-exported for existing tests that monkeypatch subprocess behavior.
-import os  # Re-exported for existing tests that monkeypatch process-group cleanup.
-import signal  # Re-exported with os for process-group cleanup tests.
 from typing import Any
 
 from spice.sandbox.factory import create_environment, create_workspace_policy
-from spice.tools.base import Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head
+from spice.tools.base import Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head_tail
 
 
 async def bash(args: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -26,10 +23,19 @@ async def bash(args: dict[str, Any], context: ToolContext) -> ToolResult:
     if result.timed_out:
         return tool_error(f"Command timed out after {timeout:g}s: {command}", result.details)
     content = result.output
-    details = {"exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr, **result.details}
+    preview = truncate_head_tail(content, 12000)
+    details = {
+        "exit_code": result.exit_code,
+        "stdout_lines": len(result.stdout.splitlines()),
+        "stderr_lines": len(result.stderr.splitlines()),
+        "stdout_chars": len(result.stdout),
+        "stderr_chars": len(result.stderr),
+        "output_truncated": preview != content,
+        **result.details,
+    }
     if result.exit_code:
-        return tool_error(truncate_head(content, 12000), details)
-    return tool_result(truncate_head(content, 12000) or "(no output)", details)
+        return tool_error(preview, details, full_content=content if preview != content else None)
+    return tool_result(preview or "(no output)", details, full_content=content if preview != content else None)
 
 
 def create_bash_tools() -> list[Tool]:

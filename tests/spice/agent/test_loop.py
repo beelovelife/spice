@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import spice.agent.loop as loop_module
 from spice.agent.events import AgentErrorEvent, AssistantMessageEvent, ToolExecutionEndEvent, TurnEndEvent
 from spice.agent.loop import run_turn
 from spice.llm.messages import Message
-from spice.llm.models import Model
+from spice.llm.models import Model, ModelPricing
 from spice.llm.types import Done, ModelRequestOptions, StreamError, TextDelta, ToolCallEvent
+from spice.llm.usage import TokenUsage
 from spice.tools.base import Tool, ToolContext, tool_result
 
 
@@ -24,6 +23,39 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         loop_module.stream_model = self.original_stream_model
+
+    async def test_records_model_usage_on_assistant_message(self) -> None:
+        async def fake_stream_model(model, messages, tools, options):
+            yield TextDelta("done")
+            yield Done("stop", TokenUsage(input_tokens=100, output_tokens=20, cache_read_tokens=60, cache_metrics_available=True))
+
+        loop_module.stream_model = fake_stream_model
+        messages = [Message(role="system", content="")]
+        model = Model(
+            id="fake",
+            provider="fake",
+            pricing=ModelPricing("1", "2", cache_read_per_million_usd="0.1"),
+        )
+
+        events = [
+            event
+            async for event in run_turn(
+                prompt="hi",
+                messages=messages,
+                model=model,
+                tools=[],
+                options=ModelRequestOptions(),
+                cwd=Path.cwd(),
+                confirm=None,
+            )
+        ]
+
+        assistant = next(event for event in events if isinstance(event, AssistantMessageEvent))
+        persisted = messages[-1].metadata["usage"]
+        self.assertEqual(assistant.usage.tokens.input_tokens, 100)
+        self.assertEqual(persisted["model_calls"], 1)
+        self.assertEqual(persisted["cache_read_tokens"], 60)
+        self.assertEqual(persisted["estimated_cost_usd"], "0.000086")
 
     async def test_requires_confirmation_defaults_to_deny(self) -> None:
         async def fake_stream_model(model, messages, tools, options):
@@ -121,55 +153,6 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(events[-1], AgentErrorEvent)
         self.assertIn("Stopped after", events[-1].message)
         self.assertIn("30 tool rounds", events[-1].message)
-
-    async def test_debug_trace_writes_round_text_and_tool_calls_to_separate_file(self) -> None:
-        calls = 0
-
-        async def fake_stream_model(model, messages, tools, options):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                yield TextDelta("I will call a tool.")
-                yield ToolCallEvent(id="tc1", name="demo", arguments={"value": "x"})
-                yield Done("tool_calls")
-            else:
-                yield TextDelta("Final answer.")
-                yield Done("stop")
-
-        loop_module.stream_model = fake_stream_model
-        tool = Tool(
-            name="demo",
-            description="demo",
-            parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
-            execute=_ok_tool,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            trace_path = Path(directory) / "spice.debug.log"
-            with patch.dict("os.environ", {"SPICE_DEBUG_TRACE": "1", "SPICE_DEBUG_TRACE_PATH": str(trace_path)}):
-                [
-                    event
-                    async for event in run_turn(
-                        prompt="hi",
-                        messages=[Message(role="system", content="")],
-                        model=Model(id="fake", provider="fake"),
-                        tools=[tool],
-                        options=ModelRequestOptions(),
-                        cwd=Path.cwd(),
-                        confirm=None,
-                        session_label="session-1",
-                    )
-                ]
-
-            trace = trace_path.read_text(encoding="utf-8")
-            self.assertIn("======== turn start session=session-1", trace)
-            self.assertIn("======== round 1 start", trace)
-            self.assertIn("I will call a tool.", trace)
-            self.assertIn("1. demo id=tc1", trace)
-            self.assertIn("---- tool start round=1 name=demo id=tc1 ----", trace)
-            self.assertIn("ok:x", trace)
-            self.assertIn("======== round 2 end", trace)
-            self.assertIn("Final answer.", trace)
-            self.assertIn("======== turn end rounds=2", trace)
 
     async def test_subagent_manager_is_passed_to_tool_context(self) -> None:
         sentinel = object()
