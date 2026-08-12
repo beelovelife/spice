@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from unittest.mock import patch
 
+from spice.sandbox.policy import WorkspacePolicy
 from spice.tools.base import ToolContext
 from spice.tools.file import apply_patch, edit_file, read_file, read_files, write_file
 from spice.tools.file_state import FileStateStore
@@ -56,6 +59,23 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.is_error)
             self.assertIn("three", result.content)
             self.assertEqual(target.read_text(encoding="utf-8"), "one\ntwo\n")
+
+    async def test_edit_file_enforces_limit_against_final_file_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "a.txt"
+            target.write_text("12345", encoding="utf-8")
+            policy = WorkspacePolicy(root=root, max_write_bytes=6)
+
+            result = await edit_file(
+                {"path": "a.txt", "old_text": "5", "new_text": "567"},
+                ToolContext(cwd=root, workspace=policy),
+            )
+
+            self.assertTrue(result.is_error)
+            self.assertEqual(result.disposition, "fatal")
+            self.assertEqual(result.error_code, "workspace_policy_denied")
+            self.assertEqual(target.read_text(encoding="utf-8"), "12345")
 
     async def test_edit_file_requires_occurrence_for_multiple_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,6 +188,21 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((root / "b.txt").exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "one\ntwo\n")
 
+    async def test_apply_patch_enforces_limit_against_final_file_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            policy = WorkspacePolicy(root=root, max_write_bytes=3)
+
+            result = await apply_patch(
+                {"operations": [{"type": "add", "path": "large.txt", "content": "1234"}]},
+                ToolContext(cwd=root, workspace=policy),
+            )
+
+            self.assertTrue(result.is_error)
+            self.assertEqual(result.disposition, "fatal")
+            self.assertEqual(result.error_code, "workspace_policy_denied")
+            self.assertFalse((root / "large.txt").exists())
+
     async def test_apply_patch_rejects_failed_operation_before_writing_anything(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -206,6 +241,39 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(result.is_error)
             self.assertEqual(target.read_text(encoding="utf-8"), "1\n2\n")
+
+    async def test_apply_patch_rolls_back_files_when_commit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.txt"
+            second = root / "b.txt"
+            first.write_text("old-a", encoding="utf-8")
+            second.write_text("old-b", encoding="utf-8")
+            original_replace = os.replace
+            replace_calls = 0
+
+            def fail_second_replace(source, target):
+                nonlocal replace_calls
+                replace_calls += 1
+                if replace_calls == 2:
+                    raise OSError("simulated commit failure")
+                return original_replace(source, target)
+
+            with patch("spice.tools.file.os.replace", side_effect=fail_second_replace):
+                result = await apply_patch(
+                    {
+                        "operations": [
+                            {"type": "replace", "path": "a.txt", "old_text": "old-a", "new_text": "new-a"},
+                            {"type": "replace", "path": "b.txt", "old_text": "old-b", "new_text": "new-b"},
+                        ]
+                    },
+                    ToolContext(cwd=root),
+                )
+
+            self.assertTrue(result.is_error)
+            self.assertEqual(result.error_code, "patch_commit_failed")
+            self.assertEqual(first.read_text(encoding="utf-8"), "old-a")
+            self.assertEqual(second.read_text(encoding="utf-8"), "old-b")
 
     async def test_apply_patch_accepts_old_str_new_str_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

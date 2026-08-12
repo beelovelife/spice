@@ -578,6 +578,32 @@ def test_file_confirmation_question_mentions_target_path() -> None:
     assert render_module._confirmation_question("edit_file", {"path": "story.md"}) == "Do you want to edit story.md?"
 
 
+def test_renderer_serializes_concurrent_tool_confirmations(monkeypatch) -> None:
+    active = 0
+    peak = 0
+
+    async def fake_select(*args, **kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return "allow"
+
+    monkeypatch.setattr(render_module, "_select_confirmation", fake_select)
+    renderer = render_module.CliRenderer(Console(file=StringIO()))
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            renderer.confirm("write_file", {"path": "a.py"}),
+            renderer.confirm("write_file", {"path": "b.py"}),
+        )
+
+    asyncio.run(exercise())
+
+    assert peak == 1
+
+
 def test_bash_confirmation_warns_for_file_modifying_commands() -> None:
     question = render_module._confirmation_question(
         "bash",

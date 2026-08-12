@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from io import StringIO
 import unittest
 
 import spice.cli.main as cli_main
@@ -17,6 +18,8 @@ from spice.tools.base import tool_result
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from rich.console import Console
+from typer.testing import CliRunner
 
 
 def _session_info(session_id: str, *, updated_at: str = "2026-06-19T00:00:00+00:00", cwd: str | None = None) -> SessionInfo:
@@ -51,13 +54,58 @@ class SlashCommandRegistryTests(unittest.TestCase):
         self.assertIn("/settings", triggers)
         self.assertIn("/subagent", triggers)
         self.assertIn("/compact", triggers)
+        self.assertIn("/memory", triggers)
         self.assertIn("/plan", triggers)
         self.assertIn("/task", triggers)
         self.assertIn("/goal", triggers)
+        self.assertIn("/cost", triggers)
+        self.assertIn("/usage", triggers)
 
     def test_skill_completion_does_not_duplicate_colon_entry(self) -> None:
         completions = list(SlashCommandRegistry().completer().get_completions(Document("/skill"), None))
         self.assertEqual([completion.text for completion in completions], ["/skills", "/skill"])
+
+
+def test_memory_slash_command_defaults_to_current_project() -> None:
+    calls = []
+
+    class FakeMemoryStore:
+        pass
+
+    class FakeAgentSession:
+        config = SpiceConfig(memory_enabled=True)
+        memory_store = FakeMemoryStore()
+
+        async def distill_current_memory(self, *, scope):
+            calls.append(scope)
+            return {"success": True, "processed": 1, "adds": 1, "replacements": 0, "removals": 0}
+
+    context = InteractiveCommandContext(
+        console=Console(file=StringIO(), force_terminal=False),
+        input_session=None,
+        renderer=type("Renderer", (), {"confirm": None})(),
+        agent_session=FakeAgentSession(),
+        cwd=cli_main.Path.cwd(),
+    )
+
+    result = asyncio.run(SlashCommandRegistry().execute("/memory", context))
+
+    assert result.handled is True
+    assert calls == ["project"]
+
+
+def test_chat_and_tui_accept_trace_options(monkeypatch) -> None:
+    monkeypatch.setattr(cli_main, "set_process_title", lambda: None)
+
+    chat = CliRunner().invoke(cli_main.app, ["chat", "--help"])
+    tui = CliRunner().invoke(cli_main.app, ["tui", "--help"])
+
+    assert chat.exit_code == 0
+    assert "--trace" in chat.output
+    assert "--trace-file" in chat.output
+    assert tui.exit_code == 0
+    assert "--trace" in tui.output
+    assert "--trace-file" in tui.output
 
 
 def test_interactive_entrypoint_uses_async_prompt(monkeypatch) -> None:
@@ -97,6 +145,47 @@ def test_interactive_entrypoint_uses_async_prompt(monkeypatch) -> None:
     assert FakePromptSession.kwargs["reserve_space_for_menu"] == run_interactive.COMPLETION_MENU_RESERVED_ROWS
     assert FakePromptSession.kwargs["reserve_space_for_menu"] == 16
     assert FakePromptSession.kwargs["mouse_support"] is run_interactive.has_completions
+
+
+def test_interactive_cli_adds_blank_line_before_response(monkeypatch) -> None:
+    class FakeExtensions:
+        errors = []
+
+        def commands(self) -> dict:
+            return {}
+
+    class FakeAgentSession:
+        session_label = "new"
+        extensions = FakeExtensions()
+        plan_state = type("PlanState", (), {"mode": "edit", "is_plan_mode": False, "steps": []})()
+
+    class FakePromptSession:
+        def __init__(self, *args, **kwargs) -> None:
+            self.completer = kwargs.get("completer")
+            self.bottom_toolbar = None
+            self._messages = iter(["hello", "quit"])
+
+        async def prompt_async(self, *args, **kwargs) -> str:
+            return next(self._messages)
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    output_before_response = []
+
+    async def fake_render_prompt(*args, **kwargs) -> bool:
+        output_before_response.append(output.getvalue())
+        return True
+
+    monkeypatch.setattr(run_interactive, "AgentSession", lambda **kwargs: FakeAgentSession())
+    monkeypatch.setattr(run_interactive, "UpwardCompletionPromptSession", FakePromptSession)
+    monkeypatch.setattr(run_interactive, "preserve_cursor_blink", lambda: None)
+    monkeypatch.setattr(run_interactive, "print_compact_welcome", lambda console: None)
+    monkeypatch.setattr(run_interactive, "render_prompt_interruptible", fake_render_prompt)
+    monkeypatch.setattr(run_interactive.sys.stdin, "isatty", lambda: True)
+
+    asyncio.run(run_interactive.run_conversation(console))
+
+    assert output_before_response[0].endswith("Session: new\n\n")
 
 
 def test_interactive_clear_alias_routes_to_clear_command(monkeypatch) -> None:
@@ -392,7 +481,7 @@ def test_reset_slash_command_keeps_session_id_and_clears_messages(monkeypatch) -
 
     assert current_session.reset_called
     assert result.clear_requested
-    assert result.session is current_session
+    assert result.session is None
 
 
 def test_reset_slash_command_cancel_keeps_current_session(monkeypatch) -> None:
@@ -446,9 +535,12 @@ def test_delete_current_slash_command_deletes_session_and_starts_fresh(monkeypat
     async def fake_select(*args, **kwargs):
         return "yes"
 
+    import spice.interactive.sessions as interactive_sessions
+
     monkeypatch.setattr(cli_commands, "_select_from_choices", fake_select)
-    monkeypatch.setattr(cli_commands, "AgentSession", FakeNewSession)
+    monkeypatch.setattr(interactive_sessions, "AgentSession", FakeNewSession)
     current_session = FakeCurrentSession()
+    current_session.confirm = None
     registry = SlashCommandRegistry()
     renderer = type("Renderer", (), {"confirm": None})()
     context = InteractiveCommandContext(
@@ -466,7 +558,7 @@ def test_delete_current_slash_command_deletes_session_and_starts_fresh(monkeypat
     assert isinstance(result.session, FakeNewSession)
     assert result.session.kwargs["provider"] == "openai"
     assert result.session.kwargs["model_id"] == "gpt-4o-mini"
-    assert result.session.kwargs["confirm"] is renderer.confirm
+    assert result.session.kwargs["confirm"] is None
     assert result.session.kwargs["session_store"] is current_session.session_store
     assert result.session.kwargs["extension_manager"] is current_session.extensions
 
@@ -544,8 +636,10 @@ def test_resume_slash_command_uses_current_model(monkeypatch) -> None:
     async def fake_select(*args, **kwargs):
         return "session-1"
 
-    monkeypatch.setattr(cli_commands, "SessionStore", lambda **kwargs: FakeStore())
-    monkeypatch.setattr(cli_commands, "AgentSession", FakeNewSession)
+    import spice.interactive.sessions as interactive_sessions
+
+    monkeypatch.setattr(interactive_sessions, "create_session_store_for_config", lambda **_kwargs: FakeStore())
+    monkeypatch.setattr(interactive_sessions, "AgentSession", FakeNewSession)
     monkeypatch.setattr(cli_commands, "_select_from_choices", fake_select)
 
     registry = SlashCommandRegistry()
@@ -594,8 +688,10 @@ def test_sessions_slash_command_includes_reset_empty_sessions(monkeypatch) -> No
     async def fake_select(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(cli_commands, "SessionStore", lambda **kwargs: FakeStore())
-    monkeypatch.setattr(cli_commands, "AgentSession", FakeNewSession)
+    import spice.interactive.sessions as interactive_sessions
+
+    monkeypatch.setattr(interactive_sessions, "create_session_store_for_config", lambda **_kwargs: FakeStore())
+    monkeypatch.setattr(interactive_sessions, "AgentSession", FakeNewSession)
     monkeypatch.setattr(cli_commands, "_select_from_choices", fake_select)
 
     registry = SlashCommandRegistry()
@@ -643,12 +739,17 @@ def test_models_slash_command_keeps_current_session_reference(monkeypatch) -> No
     async def fake_select(*args, **kwargs):
         return "deepseek/deepseek-v4-pro"
 
+    import spice.interactive.commands as interactive_commands
+    import spice.interactive.sessions as interactive_sessions
+
     saved_configs = []
-    monkeypatch.setattr(cli_commands, "ModelRegistry", FakeRegistry)
+    monkeypatch.setattr(interactive_commands, "ModelRegistry", FakeRegistry)
+    monkeypatch.setattr(interactive_sessions, "ModelRegistry", FakeRegistry)
     monkeypatch.setattr(cli_commands, "_select_from_choices", fake_select)
-    monkeypatch.setattr(cli_commands, "load_config", lambda: SpiceConfig(provider="openai", model="gpt-5.1"))
-    monkeypatch.setattr(cli_commands, "save_config", lambda config: saved_configs.append(config))
-    monkeypatch.setattr(cli_commands, "get_api_key", lambda *args, **kwargs: "key")
+    monkeypatch.setattr(interactive_commands, "load_config", lambda: SpiceConfig(provider="openai", model="gpt-5.1"))
+    monkeypatch.setattr(interactive_commands, "save_config", lambda config: saved_configs.append(config))
+    monkeypatch.setattr(interactive_commands, "get_api_key", lambda *args, **kwargs: "key")
+    monkeypatch.setattr("spice.llm.config.get_api_key", lambda *args, **kwargs: "key")
 
     current_session = FakeCurrentSession()
     registry = SlashCommandRegistry()
@@ -722,7 +823,7 @@ def test_rewind_slash_command_selects_entry_when_id_is_omitted(monkeypatch) -> N
 
     result = asyncio.run(registry.execute("/rewind", context))
 
-    assert result.session is current_session
+    assert result.session is None
     assert current_session.rewound_to == "u1"
 
 
@@ -754,7 +855,7 @@ def test_rewind_slash_command_uses_entry_id_directly(monkeypatch) -> None:
 
     result = asyncio.run(registry.execute("/rewind a1", context))
 
-    assert result.session is current_session
+    assert result.session is None
     assert current_session.rewound_to == "a1"
 
 
@@ -786,7 +887,8 @@ def test_settings_slash_command_prints_with_context_console() -> None:
     result = asyncio.run(registry.execute("/settings", context))
 
     assert result.handled
-    assert fake_console.items
+    assert result.views
+    assert fake_console.items == []
 
 
 def test_subagent_slash_command_toggles_current_session() -> None:
@@ -833,15 +935,15 @@ def test_subagent_slash_command_toggles_current_session() -> None:
     )
 
     off_result = asyncio.run(registry.execute("/subagent off", context))
-    assert off_result.session is session
+    assert off_result.session is None
     assert session.subagents_enabled is False
     assert "spawn_subagents" not in session.get_active_tools()
 
     status_result = asyncio.run(registry.execute("/subagent status", context))
-    assert status_result.session is session
+    assert status_result.session is None
 
     on_result = asyncio.run(registry.execute("/subagent on", context))
-    assert on_result.session is session
+    assert on_result.session is None
     assert session.subagents_enabled is True
     assert "spawn_subagents" in session.get_active_tools()
 
@@ -859,12 +961,12 @@ def test_sessions_delete_requires_confirmation(monkeypatch) -> None:
 
     stores = []
 
-    def fake_store(**kwargs):
+    def fake_store(_config, **kwargs):
         store = FakeStore(**kwargs)
         stores.append(store)
         return store
 
-    monkeypatch.setattr(cli_main, "SessionStore", fake_store)
+    monkeypatch.setattr(cli_main, "create_session_store", fake_store)
     monkeypatch.setattr(cli_main.typer, "confirm", lambda *args, **kwargs: False)
 
     cli_main.sessions_delete("session-1")
@@ -885,7 +987,7 @@ def test_sessions_delete_yes_skips_confirmation(monkeypatch) -> None:
 
     stores = []
 
-    def fake_store(**kwargs):
+    def fake_store(_config, **kwargs):
         store = FakeStore(**kwargs)
         stores.append(store)
         return store
@@ -893,7 +995,7 @@ def test_sessions_delete_yes_skips_confirmation(monkeypatch) -> None:
     def fail_confirm(*args, **kwargs):
         raise AssertionError("--yes should not prompt for single-session delete")
 
-    monkeypatch.setattr(cli_main, "SessionStore", fake_store)
+    monkeypatch.setattr(cli_main, "create_session_store", fake_store)
     monkeypatch.setattr(cli_main.typer, "confirm", fail_confirm)
 
     cli_main.sessions_delete("session-1", yes=True)
@@ -952,12 +1054,12 @@ def test_sessions_prune_dry_run_does_not_delete(monkeypatch) -> None:
 
     stores = []
 
-    def fake_store(**kwargs):
+    def fake_store(_config, **kwargs):
         store = FakeStore(**kwargs)
         stores.append(store)
         return store
 
-    monkeypatch.setattr(cli_main, "SessionStore", fake_store)
+    monkeypatch.setattr(cli_main, "create_session_store", fake_store)
 
     cli_main.sessions_prune(keep_recent=1)
 
@@ -982,12 +1084,12 @@ def test_sessions_prune_yes_deletes_candidates_after_confirmation(monkeypatch) -
 
     stores = []
 
-    def fake_store(**kwargs):
+    def fake_store(_config, **kwargs):
         store = FakeStore(**kwargs)
         stores.append(store)
         return store
 
-    monkeypatch.setattr(cli_main, "SessionStore", fake_store)
+    monkeypatch.setattr(cli_main, "create_session_store", fake_store)
     monkeypatch.setattr(cli_main.typer, "confirm", lambda *args, **kwargs: True)
 
     cli_main.sessions_prune(keep_recent=1, yes=True)

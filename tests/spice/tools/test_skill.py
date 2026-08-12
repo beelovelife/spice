@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from spice.skills.loader import load_skills
+from spice.skills.loader import load_skills, read_skill_content
 from spice.tools.base import ToolContext
 from spice.tools.skill import skill_view, skills_list
 
@@ -43,6 +43,19 @@ class SkillLoaderTests(unittest.TestCase):
             self.assertEqual(by_name["global-skill"].source, "user")
             self.assertEqual(by_name["same-name"].source, "project")
             self.assertTrue(any(diagnostic.type == "collision" and diagnostic.name == "same-name" for diagnostic in result.diagnostics))
+
+    def test_read_skill_content_supports_linked_files_and_blocks_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            skill_md = _write_skill(cwd / ".spice" / "skills", "repo-reader", "Read this repo", "Instructions")
+            references = skill_md.parent / "references"
+            references.mkdir()
+            (references / "flow.md").write_text("Flow reference", encoding="utf-8")
+
+            self.assertIn("Instructions", read_skill_content("repo-reader", cwd=cwd))
+            self.assertEqual(read_skill_content("repo-reader", "references/flow.md", cwd=cwd), "Flow reference")
+            with self.assertRaisesRegex(ValueError, "stay inside"):
+                read_skill_content("repo-reader", "../../outside.md", cwd=cwd)
 
 
 class SkillToolTests(unittest.IsolatedAsyncioTestCase):

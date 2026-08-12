@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from spice.llm.messages import Message, ToolCall
+from spice.llm.models import Model
 from spice.llm.providers.anthropic import _messages_to_anthropic
 import spice.llm.providers.gemini as gemini_module
-from spice.llm.providers.gemini import _fallback_tool_call_id, _messages_to_gemini
+from spice.llm.providers.gemini import GeminiProvider, _fallback_tool_call_id, _messages_to_gemini
 from spice.llm.providers.openai import _messages_to_openai, _messages_to_responses, _tool_to_response
-from spice.llm.types import ToolSchema
+from spice.llm.types import Done, ModelRequestOptions, TextDelta, ToolSchema
 
 
 class ProviderConversionTests(unittest.TestCase):
@@ -120,3 +124,37 @@ class ProviderConversionTests(unittest.TestCase):
             self.assertEqual(_fallback_tool_call_id("read file"), "read_file_abcdef123456")
         finally:
             gemini_module.uuid4 = original_uuid4
+
+    def test_gemini_provider_awaits_stream_creation_before_iterating(self) -> None:
+        awaited = False
+
+        async def chunks():
+            part = SimpleNamespace(text="hello", function_call=None)
+            content = SimpleNamespace(parts=[part])
+            yield SimpleNamespace(usage_metadata=None, candidates=[SimpleNamespace(content=content)])
+
+        async def generate_content_stream(**_kwargs):
+            nonlocal awaited
+            awaited = True
+            return chunks()
+
+        client = SimpleNamespace(
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content_stream=generate_content_stream))
+        )
+
+        async def collect():
+            with patch("google.genai.Client", return_value=client):
+                return [
+                    event
+                    async for event in GeminiProvider().astream(
+                        Model(id="gemini-test", provider="gemini"),
+                        [Message(role="user", content="hi")],
+                        [],
+                        ModelRequestOptions(api_key="test-key"),
+                    )
+                ]
+
+        events = asyncio.run(collect())
+        self.assertTrue(awaited)
+        self.assertEqual([event.text for event in events if isinstance(event, TextDelta)], ["hello"])
+        self.assertIsInstance(events[-1], Done)

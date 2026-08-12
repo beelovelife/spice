@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
 import spice.agent.agent_session as session_module
-from spice.agent.events import TextDeltaEvent, TurnEndEvent
+from spice.agent.events import AgentErrorEvent, RoundCompleteEvent, TextDeltaEvent, TurnEndEvent
 from spice.agent.agent_session import AgentSession
 from spice.agent.sessions import SessionStore, message_from_dict, message_to_dict, workspace_key
 from spice.agent.tool_results import build_tool_result_metadata, prepare_tool_message_for_session
@@ -220,12 +221,32 @@ class SessionStoreTests(unittest.TestCase):
 
             tool_meta = persisted.metadata["tool_result"]
             self.assertIn("[tool output truncated]", persisted.content)
+            self.assertIn("kept first 6000 and last 6000", persisted.content)
+            self.assertTrue(persisted.content.startswith("x" * 100))
+            self.assertTrue(persisted.content.endswith("Full output saved to " + str(Path(tool_meta["artifact_path"]))))
             self.assertTrue(tool_meta["truncated"])
             self.assertEqual(tool_meta["original_chars"], 17_000)
             artifact_path = Path(tool_meta["artifact_path"])
             self.assertTrue(artifact_path.exists())
             self.assertEqual(artifact_path.read_text(encoding="utf-8"), result.content)
             self.assertLess(len(persisted.content), len(result.content))
+
+    def test_prepare_tool_message_uses_transient_full_output_for_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            full = "head" + "x" * 13_000 + "tail"
+            result = tool_result("head [truncated] tail", full_content=full)
+            metadata = build_tool_result_metadata("bash", {"command": "test"}, result)
+            metadata["_full_tool_output"] = full
+            message = Message(role="tool", content=result.content, tool_call_id="tc1", name="bash", metadata=metadata)
+
+            persisted = prepare_tool_message_for_session(message, cwd=cwd, session_id="session-1")
+
+            tool_meta = persisted.metadata["tool_result"]
+            assert "_full_tool_output" not in persisted.metadata
+            assert Path(tool_meta["artifact_path"]).read_text(encoding="utf-8") == full
+            assert persisted.content.startswith("head")
+            assert "tail" in persisted.content
 
     def test_build_context_replaces_older_tool_results_with_context_stub(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -336,11 +357,31 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(entries[marker_id].type, "leaf")
             self.assertIn(old_id, entries)
 
+    def test_resumed_todo_state_only_reads_the_active_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root / "sessions", cwd=root)
+            info = store.create(cwd=root, provider="openai", model="gpt-5.1")
+            root_id = store.append_message(info.id, Message(role="user", content="root"))
+            store.append_custom(
+                info.id,
+                {
+                    "customType": "todo_state",
+                    "items": [{"id": "old", "content": "discarded branch", "status": "pending"}],
+                },
+                parent_id=root_id,
+            )
+            store.set_leaf(info.id, root_id)
+
+            resumed = AgentSession(cwd=root, session_id=info.id, session_store=store)
+
+            self.assertEqual(resumed.todo_state.read(), [])
+
     def test_compaction_context_skips_entries_before_first_kept_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
             info = store.create(cwd=Path.cwd(), provider="openai", model="gpt-4o-mini")
-            old_id = store.append_message(info.id, Message(role="user", content='{"partial": false, "kept": "old"}'))
+            store.append_message(info.id, Message(role="user", content='{"partial": false, "kept": "old"}'))
             kept_id = store.append_message(info.id, Message(role="assistant", content="kept"))
             compact_id = store.append_compaction(
                 info.id,
@@ -493,6 +534,76 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class AgentSessionPersistenceTests(unittest.TestCase):
+    def test_round_complete_persists_before_prompt_finishes(self) -> None:
+        async def fake_run_turn(**kwargs):
+            kwargs["messages"].extend(
+                [
+                    Message(role="user", content=kwargs["prompt"]),
+                    Message(role="assistant", content="", tool_calls=[ToolCall("tc1", "demo", {})]),
+                    Message(role="tool", content="ok", tool_call_id="tc1", name="demo"),
+                ]
+            )
+            yield RoundCompleteEvent(1)
+            await asyncio.Event().wait()
+
+        session_module.run_turn = fake_run_turn
+
+        async def run():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                store = SessionStore(root / "sessions", cwd=root)
+                session = AgentSession(cwd=root, session_store=store)
+                events = session.prompt("hello")
+                await anext(events)  # AgentStartEvent
+                event = await anext(events)
+                persisted_roles = [entry.data["message"]["role"] for entry in store.path_entries(session.session_id) if entry.type == "message"]
+                await events.aclose()
+                return event, persisted_roles
+
+
+        event, roles = asyncio.run(run())
+
+        self.assertIsInstance(event, RoundCompleteEvent)
+        self.assertEqual(roles, ["user", "assistant", "tool"])
+
+    def test_cancellation_persists_interrupted_tool_result(self) -> None:
+        async def fake_run_turn(**kwargs):
+            kwargs["messages"].extend(
+                [
+                    Message(role="user", content=kwargs["prompt"]),
+                    Message(role="assistant", content="", tool_calls=[ToolCall("tc1", "bash", {"command": "sleep 10"})]),
+                ]
+            )
+            await asyncio.Event().wait()
+            if False:
+                yield TurnEndEvent("")
+
+        session_module.run_turn = fake_run_turn
+
+        async def run():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                store = SessionStore(root / "sessions", cwd=root)
+                session = AgentSession(cwd=root, session_store=store)
+
+                async def consume():
+                    return [event async for event in session.prompt("run")]
+
+                task = asyncio.create_task(consume())
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                task.cancel()
+                events = await task
+                messages = store.load_messages(session.session_id)
+                return events, messages
+
+
+        events, messages = asyncio.run(run())
+        interrupted = next(message for message in messages if message.role == "tool")
+
+        self.assertTrue(any(isinstance(event, AgentErrorEvent) and event.kind == "user_interrupted" for event in events))
+        self.assertTrue(interrupted.is_error)
+        self.assertEqual(interrupted.metadata["tool_result"]["error_code"], "user_interrupted")
     def setUp(self) -> None:
         self.original_run_turn = session_module.run_turn
         self.original_generate_summary = session_module.generate_summary
@@ -557,7 +668,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
 
         session_module.run_turn = fake_run_turn
 
-        import asyncio
 
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -609,7 +719,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 persisted = store.load_messages(session.session_id)
                 return yielded, first_seen, second_seen, persisted
 
-        import asyncio
 
         yielded, first_seen, second_seen, persisted = asyncio.run(run())
 
@@ -642,7 +751,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 persisted = store.load_messages(session.session_id)
                 return yielded, persisted
 
-        import asyncio
 
         yielded, persisted = asyncio.run(run())
 
@@ -670,7 +778,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 events = [event async for event in session.prompt("@ui.png analyze")]
                 return events, session
 
-        import asyncio
 
         events, session = asyncio.run(run())
 
@@ -701,7 +808,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 entries = session.session_store.path_entries(session.session_id)
                 return session, resumed, entries
 
-        import asyncio
 
         session, resumed, entries = asyncio.run(run())
 
@@ -763,7 +869,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 leaf_id = session.session_store.info(session.session_id).leaf_id
                 return entries, leaf_id
 
-        import asyncio
 
         entries, leaf_id = asyncio.run(run())
         todo_index = next(index for index, entry in enumerate(entries) if entry.type == "custom" and entry.data.get("customType") == "todo_state")
@@ -804,7 +909,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 ]
                 return user_messages
 
-        import asyncio
 
         user_messages = asyncio.run(run())
 
@@ -846,7 +950,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                     return session, str(exc)
                 raise AssertionError("Expected message persistence to fail")
 
-        import asyncio
 
         session, error = asyncio.run(run())
 
@@ -877,7 +980,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 resumed = AgentSession(cwd=root, session_id=session.session_id, session_store=store)
                 return edit_tools, plan_tools, resumed
 
-        import asyncio
 
         edit_tools, plan_tools, resumed = asyncio.run(run())
 
@@ -953,7 +1055,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 await session.compact(force=True)
                 return session
 
-        import asyncio
 
         session = asyncio.run(run())
 
@@ -999,7 +1100,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 loaded = store.load_messages(info.id)
                 return yielded, entries, loaded
 
-        import asyncio
 
         yielded, entries, loaded = asyncio.run(run())
 
@@ -1029,7 +1129,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 yielded = [type(event).__name__ async for event in session.prompt("hello")]
                 return yielded, seen, session.listener_errors
 
-        import asyncio
 
         yielded, seen, errors = asyncio.run(run())
 
@@ -1069,7 +1168,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 ]
                 return resumed.long_task_state.objective, refs, files_exist
 
-        import asyncio
 
         objective, refs, files_exist = asyncio.run(run())
 
@@ -1106,7 +1204,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 completed_tools = session.get_active_tools()
                 return active_tools, completed_tools
 
-        import asyncio
 
         active_tools, completed_tools = asyncio.run(run())
 
@@ -1155,7 +1252,6 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 completed = session.complete_long_task(note="verified")
                 return rejected, completed.status, completed.completion_candidate
 
-        import asyncio
 
         rejected, status, completion_candidate = asyncio.run(run())
 

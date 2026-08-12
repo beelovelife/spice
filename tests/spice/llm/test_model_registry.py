@@ -137,6 +137,35 @@ class ModelRegistryTests(unittest.TestCase):
             self.assertEqual(getattr(provider, "default_base_url", None), "http://localhost:1234/v1")
             self.assertFalse(getattr(provider, "use_responses", False))
 
+    def test_custom_profile_can_define_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "models": {
+                            "priced": {
+                                "provider": "local-openai",
+                                "model": "priced-model",
+                                "protocol": "openai-completions",
+                                "pricing": {
+                                    "inputPerMillionUsd": "1.5",
+                                    "outputPerMillionUsd": "3",
+                                    "cacheReadPerMillionUsd": "0.15",
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            model = ModelRegistry(path).find(None, "priced")
+
+            self.assertEqual(model.pricing.input_per_million_usd, "1.5")
+            self.assertEqual(model.pricing.output_per_million_usd, "3")
+            self.assertEqual(model.pricing.cache_read_per_million_usd, "0.15")
+
     def test_profile_can_override_builtin_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
