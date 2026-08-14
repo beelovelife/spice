@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from spice.agent.debug_trace import trace_tool_end, trace_tool_start
 from spice.agent.events import AgentEvent, ToolExecutionEndEvent, ToolExecutionStartEvent
 from spice.agent.logging_config import get_logger
 from spice.agent.tool_results import build_tool_result_metadata
@@ -98,7 +97,7 @@ async def execute_tool_calls(
         )
         if parallel:
             outcomes = []
-            queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+            queue: asyncio.Queue[tuple[str, ToolExecutionStartEvent | ToolCallOutcome]] = asyncio.Queue()
             semaphore = asyncio.Semaphore(max(max_concurrency, 1))
             started_ids: set[str] = set()
             batch_fatal = False
@@ -122,13 +121,12 @@ async def execute_tool_calls(
             tasks = [asyncio.create_task(worker(item)) for item in batch]
             try:
                 while len(outcomes) < len(batch):
-                    kind, payload = await queue.get()
-                    if kind == "event":
-                        if isinstance(payload, ToolExecutionStartEvent):
-                            started_ids.add(payload.tool_call_id)
-                        yield payload  # type: ignore[misc]
+                    _kind, payload = await queue.get()
+                    if isinstance(payload, ToolExecutionStartEvent):
+                        started_ids.add(payload.tool_call_id)
+                        yield payload
                     else:
-                        outcome = payload  # type: ignore[assignment]
+                        outcome = payload
                         outcomes.append(outcome)
                         yield ToolExecutionEndEvent(
                             outcome.prepared.call.id,
@@ -143,13 +141,12 @@ async def execute_tool_calls(
                             await asyncio.gather(*tasks, return_exceptions=True)
                             completed_ids = {item.prepared.call.id for item in outcomes}
                             while not queue.empty():
-                                queued_kind, queued_payload = queue.get_nowait()
-                                if queued_kind == "event":
-                                    if isinstance(queued_payload, ToolExecutionStartEvent):
-                                        started_ids.add(queued_payload.tool_call_id)
-                                    yield queued_payload  # type: ignore[misc]
+                                _queued_kind, queued_payload = queue.get_nowait()
+                                if isinstance(queued_payload, ToolExecutionStartEvent):
+                                    started_ids.add(queued_payload.tool_call_id)
+                                    yield queued_payload
                                     continue
-                                queued_outcome = queued_payload  # type: ignore[assignment]
+                                queued_outcome = queued_payload
                                 queued_id = queued_outcome.prepared.call.id
                                 if queued_id in completed_ids:
                                     continue
@@ -298,7 +295,13 @@ async def _execute_one(
 ) -> ToolCallOutcome:
     call = prepared.call
     started = time.perf_counter()
-    trace_tool_start(round_index, call)
+    logger.debug(
+        "tool_start round=%d name=%s id=%s argument_keys=%s",
+        round_index,
+        call.name,
+        call.id,
+        ",".join(sorted(call.arguments)) or "<none>",
+    )
     if prepared.immediate_result is not None:
         result = prepared.immediate_result
     else:
@@ -335,7 +338,14 @@ async def _execute_one(
                 code="unexpected_tool_error",
             )
     duration_ms = int((time.perf_counter() - started) * 1000)
-    trace_tool_end(round_index, call, result, duration_ms=duration_ms)
+    logger.debug(
+        "tool_result round=%d name=%s id=%s content_chars=%d detail_keys=%s",
+        round_index,
+        call.name,
+        call.id,
+        len(result.content),
+        ",".join(sorted(result.details)) or "<none>",
+    )
     logger.info(
         "tool_end round=%d name=%s id=%s is_error=%s disposition=%s duration_ms=%d",
         round_index,
@@ -370,13 +380,16 @@ async def _persist_outcomes(
     for outcome in sorted(outcomes, key=lambda item: item.prepared.index):
         call = outcome.prepared.call
         result = outcome.result
+        metadata = build_tool_result_metadata(call.name, call.arguments, result)
+        if result.full_content is not None:
+            metadata["_full_tool_output"] = result.full_content
         message = Message(
             role="tool",
             content=result.content,
             tool_call_id=call.id,
             name=call.name,
             is_error=result.is_error,
-            metadata=build_tool_result_metadata(call.name, call.arguments, result),
+            metadata=metadata,
         )
         messages.append(message)
         model_messages.append(message)

@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_DIR = Path.home() / ".spice"
+CONFIG_DIR = Path(os.environ.get("SPICE_CONFIG_DIR", Path.home() / ".spice")).expanduser()
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 SECRETS_PATH = CONFIG_DIR / "secrets.json"
 logger = logging.getLogger(__name__)
@@ -96,8 +96,10 @@ class SpiceConfig:
     protocol: str | None = "openai-completions"
     base_url: str | None = None
     model_profiles: dict[str, Any] = field(default_factory=dict)
-    debug_trace: bool = False
     memory_enabled: bool = False
+    memory_user_char_limit: int = 1_500
+    memory_global_char_limit: int = 3_000
+    memory_project_char_limit: int = 3_000
     subagents_enabled: bool = True
     max_concurrent_subagents: int = 3
     logging_retention_days: int = 7
@@ -196,27 +198,33 @@ def save_config(config: SpiceConfig) -> None:
     profile.pop("apiKey", None)
     profile.pop("api_key", None)
     model_profiles[profile_key] = profile
-    payload: dict[str, Any] = {
-        "defaultModel": profile_key,
-        "models": model_profiles,
-        "debug": {
-            "trace": config.debug_trace,
-        },
-        "memory": {
-            "enabled": config.memory_enabled,
-        },
-        "subagents": {
-            "enabled": config.subagents_enabled,
-            "max_concurrent": config.max_concurrent_subagents,
-        },
-        "logging": {
-            "retention_days": config.logging_retention_days,
-        },
-        "sandbox": config.sandbox,
-        "storage": config.storage,
-        "tools": config.tools,
-        "modelRouting": config.model_routing,
-    }
+    # settings.json is shared by core configuration, MCP, provider declarations,
+    # and extensions. Update the fields owned by SpiceConfig without dropping
+    # unknown top-level keys owned by those other subsystems.
+    payload: dict[str, Any] = copy.deepcopy(data)
+    payload.update(
+        {
+            "defaultModel": profile_key,
+            "models": model_profiles,
+            "memory": {
+                "enabled": config.memory_enabled,
+                "userCharLimit": config.memory_user_char_limit,
+                "globalCharLimit": config.memory_global_char_limit,
+                "projectCharLimit": config.memory_project_char_limit,
+            },
+            "subagents": {
+                "enabled": config.subagents_enabled,
+                "max_concurrent": config.max_concurrent_subagents,
+            },
+            "logging": {
+                "retention_days": config.logging_retention_days,
+            },
+            "sandbox": config.sandbox,
+            "storage": config.storage,
+            "tools": config.tools,
+            "modelRouting": config.model_routing,
+        }
+    )
     _write_private_json(SETTINGS_PATH, payload)
 
 
@@ -250,13 +258,21 @@ def _config_values_from_settings(data: dict[str, Any]) -> dict[str, Any]:
                     except (TypeError, ValueError):
                         pass
 
-    debug_settings = data.get("debug")
-    if isinstance(debug_settings, dict) and "trace" in debug_settings:
-        values["debug_trace"] = bool(debug_settings.get("trace"))
-
     memory_settings = data.get("memory")
-    if isinstance(memory_settings, dict) and "enabled" in memory_settings:
-        values["memory_enabled"] = bool(memory_settings.get("enabled"))
+    if isinstance(memory_settings, dict):
+        if "enabled" in memory_settings:
+            values["memory_enabled"] = bool(memory_settings.get("enabled"))
+        for field_name, keys, default in (
+            ("memory_user_char_limit", ("userCharLimit", "user_char_limit"), SpiceConfig.memory_user_char_limit),
+            ("memory_global_char_limit", ("globalCharLimit", "global_char_limit"), SpiceConfig.memory_global_char_limit),
+            ("memory_project_char_limit", ("projectCharLimit", "project_char_limit"), SpiceConfig.memory_project_char_limit),
+        ):
+            raw = next((memory_settings[key] for key in keys if key in memory_settings), None)
+            if raw is not None:
+                try:
+                    values[field_name] = max(1, int(raw))
+                except (TypeError, ValueError):
+                    values[field_name] = default
 
     subagent_settings = data.get("subagents")
     if isinstance(subagent_settings, dict):
@@ -264,7 +280,7 @@ def _config_values_from_settings(data: dict[str, Any]) -> dict[str, Any]:
             values["subagents_enabled"] = bool(subagent_settings.get("enabled"))
         if "max_concurrent" in subagent_settings:
             try:
-                max_concurrent = int(subagent_settings.get("max_concurrent"))
+                max_concurrent = int(subagent_settings["max_concurrent"])
             except (TypeError, ValueError):
                 max_concurrent = SpiceConfig.max_concurrent_subagents
             values["max_concurrent_subagents"] = min(max(max_concurrent, 1), 3)
@@ -272,7 +288,7 @@ def _config_values_from_settings(data: dict[str, Any]) -> dict[str, Any]:
     logging_settings = data.get("logging")
     if isinstance(logging_settings, dict) and "retention_days" in logging_settings:
         try:
-            retention_days = int(logging_settings.get("retention_days"))
+            retention_days = int(logging_settings["retention_days"])
         except (TypeError, ValueError):
             retention_days = SpiceConfig.logging_retention_days
         values["logging_retention_days"] = max(retention_days, 1)

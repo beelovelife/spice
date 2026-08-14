@@ -14,6 +14,8 @@ from spice.agent.events import (
     AssistantMessageEvent,
     ModelFallbackEvent,
     ModelRetryEvent,
+    ReasoningDeltaEvent,
+    RoundCompleteEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -76,10 +78,14 @@ def _extension_event_payload(event: AgentEvent) -> tuple[str | None, dict[str, A
         return "agent_end", {"session_id": event.session_id}
     if isinstance(event, TurnStartEvent):
         return "turn_start", {"prompt": event.prompt}
+    if isinstance(event, RoundCompleteEvent):
+        return "round_complete", {"round_index": event.round_index}
     if isinstance(event, TurnEndEvent):
         return "turn_end", {"text": event.text}
     if isinstance(event, TextDeltaEvent):
         return "text_delta", {"text": event.text}
+    if isinstance(event, ReasoningDeltaEvent):
+        return "reasoning_delta", {"text": event.text, "kind": event.kind}
     if isinstance(event, AssistantMessageEvent):
         return "assistant_message", {"text": event.text, "tool_calls": event.tool_calls}
     if isinstance(event, ModelRetryEvent):
@@ -101,9 +107,17 @@ def _extension_event_payload(event: AgentEvent) -> tuple[str | None, dict[str, A
             "reason": event.reason,
         }
     if isinstance(event, ToolExecutionStartEvent):
-        return "tool_execution_start", {"tool_call_id": event.tool_call_id, "tool_name": event.tool_name, "args": event.args}
+        return "tool_execution_start", {
+            "tool_call_id": event.tool_call_id,
+            "tool_name": event.tool_name,
+            "args": event.args,
+        }
     if isinstance(event, ToolExecutionEndEvent):
-        return "tool_execution_end", {"tool_call_id": event.tool_call_id, "tool_name": event.tool_name, "result": event.result}
+        return "tool_execution_end", {
+            "tool_call_id": event.tool_call_id,
+            "tool_name": event.tool_name,
+            "result": event.result,
+        }
     if isinstance(event, AgentErrorEvent):
         return "agent_error", {"message": event.message, "kind": event.kind}
     return None, {}

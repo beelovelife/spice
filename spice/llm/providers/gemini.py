@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from spice.agent.logging_config import get_logger
 from spice.llm.error_safety import stream_error_from_exception
 from spice.llm.messages import Message
 from spice.llm.models import Model
+from spice.llm.providers.client_cache import get_cached_client
 from spice.llm.types import Done, StreamError, StreamEvent, ModelRequestOptions, TextDelta, ToolCallEvent, ToolSchema
+from spice.llm.usage import TokenUsage, normalize_gemini_usage
 
 logger = get_logger(__name__)
 
@@ -46,7 +48,7 @@ class GeminiProvider:
                 len(messages),
                 len(tools),
             )
-            client = genai.Client(api_key=options.api_key)
+            client = get_cached_client(("gemini", options.api_key), lambda: genai.Client(api_key=options.api_key))
             system, contents = _messages_to_gemini(messages)
             config: dict[str, Any] = {
                 "temperature": options.temperature,
@@ -56,12 +58,15 @@ class GeminiProvider:
                 config["system_instruction"] = system
             if tools:
                 config["tools"] = [{"function_declarations": [_tool_to_gemini(tool) for tool in tools]}]
-            stream = client.aio.models.generate_content_stream(
+            stream = await client.aio.models.generate_content_stream(
                 model=model.id,
                 contents=contents,
-                config=config,
+                config=cast(Any, config),
             )
+            usage: TokenUsage | None = None
             async for chunk in stream:
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    usage = normalize_gemini_usage(chunk.usage_metadata)
                 for candidate in chunk.candidates or []:
                     content = candidate.content
                     for part in content.parts if content and content.parts else []:
@@ -81,7 +86,7 @@ class GeminiProvider:
                 model.id,
                 int((time.perf_counter() - started) * 1000),
             )
-            yield Done("stop")
+            yield Done("stop", usage=usage)
         except Exception as exc:
             logger.exception(
                 "provider_request_error provider=Gemini model=%s duration_ms=%d",

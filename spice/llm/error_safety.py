@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-from spice.llm.types import StreamError
+from spice.llm.types import StreamError, StreamErrorKind
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,7 @@ def public_exception_message(exc: BaseException, *, prefix: str) -> str:
 def stream_error_from_exception(exc: BaseException, *, prefix: str, provider: str, model: str) -> StreamError:
     status = _status_code(exc)
     category = classify_exception(exc)
+    kind: StreamErrorKind
     if status in {401, 403}:
         kind = "authentication"
     elif status == 429:
@@ -56,13 +57,14 @@ def stream_error_from_exception(exc: BaseException, *, prefix: str, provider: st
     elif status is not None and 400 <= status < 500:
         kind = "invalid_request"
     else:
-        kind = {
+        category_kinds: dict[str, StreamErrorKind] = {
             "auth": "authentication",
             "rate_limit": "rate_limit",
             "service": "server",
             "timeout": "timeout",
             "network": "network",
-        }.get(category, "unknown")
+        }
+        kind = category_kinds.get(category, "unknown")
     retryable = kind in {"network", "timeout", "rate_limit", "server"} or status in {408, 429, 500, 502, 503, 504}
     return StreamError(
         public_exception_message(exc, prefix=prefix),

@@ -22,6 +22,10 @@ class Skill:
     triggers: list[str] = field(default_factory=list)
     always: bool = False
 
+    @property
+    def priority(self) -> int:
+        return {"user": 0, "project": 1, "path": 2}.get(self.source, 0)
+
 
 @dataclass(frozen=True)
 class SkillDiagnostic:
@@ -113,6 +117,25 @@ def read_skill_file(path: Path, *, source: str = "path") -> Skill:
         triggers=trigger_list,
         always=bool(metadata.get("always", False)),
     )
+
+
+def read_skill_content(name: str, file_path: str | None = None, *, cwd: Path) -> str:
+    result = load_skills(cwd=cwd)
+    skill = next((item for item in result.skills if item.name == name), None)
+    if skill is None:
+        raise ValueError(f"Skill not found: {name}")
+    target = skill.path
+    if file_path:
+        root = skill.path.parent.resolve()
+        target = (root / file_path).resolve()
+        if target != root and root not in target.parents:
+            raise ValueError("Skill file must stay inside the skill directory.")
+        if not target.is_file():
+            raise ValueError(f"Linked skill file does not exist: {file_path}")
+    try:
+        return target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Could not read skill file: {target}") from exc
 
 
 def linked_files(skill: Skill) -> list[Path]:

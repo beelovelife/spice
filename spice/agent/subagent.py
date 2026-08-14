@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from spice.agent.events import AgentErrorEvent, AssistantMessageEvent, ToolExecutionEndEvent, TurnEndEvent
+from spice.agent.events import AgentErrorEvent, AssistantMessageEvent, TurnEndEvent
 from spice.agent.prompts import build_system_prompt
 from spice.llm.config import get_api_key, load_config
 from spice.llm.messages import Message

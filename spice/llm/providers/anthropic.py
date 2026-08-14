@@ -10,7 +10,9 @@ from spice.agent.logging_config import get_logger
 from spice.llm.error_safety import stream_error_from_exception
 from spice.llm.messages import Message
 from spice.llm.models import Model
+from spice.llm.providers.client_cache import get_cached_client
 from spice.llm.types import Done, StreamError, StreamEvent, ModelRequestOptions, TextDelta, ToolCallEvent, ToolSchema
+from spice.llm.usage import normalize_anthropic_usage
 
 logger = get_logger(__name__)
 
@@ -42,7 +44,10 @@ class AnthropicProvider:
 
         system, anthropic_messages = _messages_to_anthropic(messages)
         base_url = options.base_url or self.default_base_url
-        client = AsyncAnthropic(api_key=options.api_key, base_url=base_url, max_retries=0)
+        client = get_cached_client(
+            ("anthropic", options.api_key, base_url),
+            lambda: AsyncAnthropic(api_key=options.api_key, base_url=base_url, max_retries=0),
+        )
         started = time.perf_counter()
         try:
             logger.info(
@@ -60,6 +65,7 @@ class AnthropicProvider:
                 tools=[_tool_to_anthropic(tool) for tool in tools] or None,
                 temperature=options.temperature,
                 max_tokens=options.max_tokens,
+                cache_control={"type": "ephemeral"},
             ) as stream:
                 async for event in stream:
                     # The SDK's MessageStream emits a high-level "text" event per text delta.
@@ -75,7 +81,7 @@ class AnthropicProvider:
                     message.stop_reason,
                     int((time.perf_counter() - started) * 1000),
                 )
-                yield Done(message.stop_reason)
+                yield Done(message.stop_reason, usage=normalize_anthropic_usage(message.usage))
         except Exception as exc:
             logger.exception(
                 "provider_request_error provider=Anthropic model=%s duration_ms=%d",

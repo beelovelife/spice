@@ -10,7 +10,6 @@ from spice.llm.config import CONFIG_DIR
 
 LOG_DIR = CONFIG_DIR / "logs"
 LOG_PATH = LOG_DIR / "spice.log"
-DEBUG_LOG_PATH = CONFIG_DIR / "spice.debug.log"
 
 _CONFIGURED = False
 _LOG_PATH: Path | None = None
@@ -19,7 +18,7 @@ _LOG_PATH: Path | None = None
 def configure_logging(*, debug: bool = False, log_path: Path | None = None) -> Path:
     """Configure process-wide file logging once and return the active log path."""
     global _CONFIGURED, _LOG_PATH
-    path = log_path or (DEBUG_LOG_PATH if debug else LOG_PATH)
+    path = log_path or LOG_PATH
     if _CONFIGURED:
         return _LOG_PATH or path
 
@@ -44,3 +43,7 @@ def get_logger(name: str) -> logging.Logger:
 
 def log_path() -> Path:
     return _LOG_PATH or LOG_PATH
+
+
+def log_level_name() -> str:
+    return logging.getLevelName(logging.getLogger("spice").getEffectiveLevel())

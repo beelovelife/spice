@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from spice.llm.messages import ToolCall
+from spice.llm.usage import ModelUsageRecord
 from spice.tools.base import ToolResult
 
 
@@ -29,14 +30,28 @@ class TurnStartEvent(AgentEvent):
 
 
 @dataclass
+class RoundCompleteEvent(AgentEvent):
+    round_index: int
+
+
+@dataclass
 class TextDeltaEvent(AgentEvent):
     text: str
+
+
+@dataclass
+class ReasoningDeltaEvent(AgentEvent):
+    """Provider reasoning output intended only for the live frontend."""
+
+    text: str
+    kind: str = "reasoning"
 
 
 @dataclass
 class AssistantMessageEvent(AgentEvent):
     text: str
     tool_calls: list[ToolCall]
+    usage: ModelUsageRecord | None = None
 
 
 @dataclass

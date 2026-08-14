@@ -8,37 +8,106 @@ from pathlib import Path
 from typing import Any
 
 from spice.llm.config import SETTINGS_PATH, SpiceConfig
-from spice.llm.models import Model
+from spice.llm.models import Model, ModelPricing
 
 BUILTIN_MODELS = [
-    Model(id="gpt-4o-mini", provider="openai", context_window=128000, output_tokens=4096, protocol="openai-completions", api_key_envs=["OPENAI_API_KEY"]),
-    Model(id="gpt-4o", provider="openai", context_window=128000, output_tokens=4096, protocol="openai-completions", api_key_envs=["OPENAI_API_KEY"]),
-    Model(id="gpt-5.1", provider="openai", context_window=256000, output_tokens=8192, protocol="openai-completions", api_key_envs=["OPENAI_API_KEY"]),
+    Model(
+        id="gpt-4o-mini",
+        provider="openai",
+        context_window=128000,
+        output_tokens=4096,
+        protocol="openai-responses",
+        api_key_envs=["OPENAI_API_KEY"],
+    ),
+    Model(
+        id="gpt-4o",
+        provider="openai",
+        context_window=128000,
+        output_tokens=4096,
+        protocol="openai-responses",
+        api_key_envs=["OPENAI_API_KEY"],
+    ),
+    Model(
+        id="gpt-5.1",
+        provider="openai",
+        context_window=256000,
+        output_tokens=8192,
+        supports_reasoning=True,
+        protocol="openai-responses",
+        api_key_envs=["OPENAI_API_KEY"],
+    ),
     Model(
         id="deepseek-v4-flash",
         provider="deepseek",
         context_window=1000000,
         output_tokens=60000,
-        protocol="openai-completions",
+        supports_reasoning=True,
+        protocol="openai-responses",
         base_url="https://api.deepseek.com",
         api_key_envs=["DEEPSEEK_API_KEY"],
         provider_name="DeepSeek",
+        pricing=ModelPricing(
+            input_per_million_usd="0.14",
+            output_per_million_usd="0.28",
+            cache_read_per_million_usd="0.0028",
+        ),
     ),
     Model(
         id="deepseek-v4-pro",
         provider="deepseek",
         context_window=1000000,
         output_tokens=60000,
-        protocol="openai-completions",
+        supports_reasoning=True,
+        protocol="openai-responses",
         base_url="https://api.deepseek.com",
         api_key_envs=["DEEPSEEK_API_KEY"],
         provider_name="DeepSeek",
+        pricing=ModelPricing(
+            input_per_million_usd="0.435",
+            output_per_million_usd="0.87",
+            cache_read_per_million_usd="0.003625",
+        ),
     ),
-    Model(id="claude-haiku-4-5", provider="anthropic", context_window=200000, output_tokens=64000, protocol="anthropic-messages", api_key_envs=["ANTHROPIC_API_KEY"]),
-    Model(id="claude-sonnet-4-6", provider="anthropic", context_window=1000000, output_tokens=128000, protocol="anthropic-messages", api_key_envs=["ANTHROPIC_API_KEY"]),
-    Model(id="claude-opus-4-8", provider="anthropic", context_window=1000000, output_tokens=128000, protocol="anthropic-messages", api_key_envs=["ANTHROPIC_API_KEY"]),
-    Model(id="gemini-2.5-pro", provider="gemini", context_window=1000000, output_tokens=8192, protocol="google-generative-ai", api_key_envs=["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-    Model(id="gemini-2.5-flash", provider="gemini", context_window=1000000, output_tokens=8192, protocol="google-generative-ai", api_key_envs=["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    Model(
+        id="claude-haiku-4-5",
+        provider="anthropic",
+        context_window=200000,
+        output_tokens=64000,
+        protocol="anthropic-messages",
+        api_key_envs=["ANTHROPIC_API_KEY"],
+    ),
+    Model(
+        id="claude-sonnet-4-6",
+        provider="anthropic",
+        context_window=1000000,
+        output_tokens=128000,
+        protocol="anthropic-messages",
+        api_key_envs=["ANTHROPIC_API_KEY"],
+    ),
+    Model(
+        id="claude-opus-4-8",
+        provider="anthropic",
+        context_window=1000000,
+        output_tokens=128000,
+        protocol="anthropic-messages",
+        api_key_envs=["ANTHROPIC_API_KEY"],
+    ),
+    Model(
+        id="gemini-2.5-pro",
+        provider="gemini",
+        context_window=1000000,
+        output_tokens=8192,
+        protocol="google-generative-ai",
+        api_key_envs=["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    ),
+    Model(
+        id="gemini-2.5-flash",
+        provider="gemini",
+        context_window=1000000,
+        output_tokens=8192,
+        protocol="google-generative-ai",
+        api_key_envs=["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    ),
 ]
 
 
@@ -101,6 +170,7 @@ class ModelRegistry:
             if model:
                 self.register(model)
 
+
 def _model_from_profile(profile_key: str, data: dict[str, Any]) -> Model | None:
     provider = data.get("provider")
     model_id = data.get("model") or data.get("id")
@@ -111,15 +181,56 @@ def _model_from_profile(profile_key: str, data: dict[str, Any]) -> Model | None:
         provider=provider,
         profile_key=profile_key,
         name=data.get("name"),
-        context_window=_int_field(data, "context_window", aliases=["contextWindow"], default=128000),
+        context_window=_int_field(
+            data, "context_window", aliases=["contextWindow"], default=128000
+        ),
         output_tokens=_output_tokens_field(data, default=4096),
-        supports_vision=_bool_field(data, "supports_vision", aliases=["supportsVision", "vision"], default=False),
+        supports_vision=_bool_field(
+            data, "supports_vision", aliases=["supportsVision", "vision"], default=False
+        ),
+        supports_reasoning=_bool_field(
+            data,
+            "supports_reasoning",
+            aliases=["supportsReasoning", "reasoning"],
+            default=False,
+        ),
         temperature=_float_field(data, "temperature"),
         protocol=_protocol_value(data),
         base_url=_optional_str(data.get("base_url") or data.get("baseUrl")),
         api_key_envs=_api_key_envs(data),
-        provider_name=_optional_str(data.get("provider_name") or data.get("providerName")),
+        provider_name=_optional_str(
+            data.get("provider_name") or data.get("providerName")
+        ),
+        pricing=_pricing_value(data.get("pricing")),
     )
+
+
+def _pricing_value(value: Any) -> ModelPricing | None:
+    if not isinstance(value, dict):
+        return None
+    input_price = value.get("input_per_million_usd") or value.get("inputPerMillionUsd")
+    output_price = value.get("output_per_million_usd") or value.get(
+        "outputPerMillionUsd"
+    )
+    if input_price is None or output_price is None:
+        return None
+    return ModelPricing(
+        input_per_million_usd=str(input_price),
+        output_per_million_usd=str(output_price),
+        cache_read_per_million_usd=_optional_price(
+            value, "cache_read_per_million_usd", "cacheReadPerMillionUsd"
+        ),
+        cache_write_per_million_usd=_optional_price(
+            value, "cache_write_per_million_usd", "cacheWritePerMillionUsd"
+        ),
+    )
+
+
+def _optional_price(value: dict[str, Any], snake: str, camel: str) -> str | None:
+    raw = value.get(snake)
+    if raw is None:
+        raw = value.get(camel)
+    return str(raw) if raw is not None else None
 
 
 def _optional_str(value: Any) -> str | None:
@@ -130,7 +241,9 @@ def _protocol_value(data: dict[str, Any]) -> str | None:
     return _optional_str(data.get("protocol") or data.get("api"))
 
 
-def _int_field(data: dict[str, Any], name: str, *, aliases: list[str], default: int) -> int:
+def _int_field(
+    data: dict[str, Any], name: str, *, aliases: list[str], default: int
+) -> int:
     raw = data.get(name)
     for alias in aliases:
         if raw is None:
@@ -141,7 +254,9 @@ def _int_field(data: dict[str, Any], name: str, *, aliases: list[str], default: 
         return default
 
 
-def _bool_field(data: dict[str, Any], name: str, *, aliases: list[str], default: bool) -> bool:
+def _bool_field(
+    data: dict[str, Any], name: str, *, aliases: list[str], default: bool
+) -> bool:
     raw = data.get(name)
     for alias in aliases:
         if raw is None:

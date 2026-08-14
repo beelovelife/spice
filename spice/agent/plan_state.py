@@ -34,8 +34,8 @@ class PlanState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PlanState":
-        mode = data.get("mode") if data.get("mode") in {"edit", "plan"} else "edit"
-        approval = data.get("approvalMode") if data.get("approvalMode") in {"manual", "auto"} else "manual"
+        mode: InteractionMode = "plan" if data.get("mode") == "plan" else "edit"
+        approval: ApprovalMode = "auto" if data.get("approvalMode") == "auto" else "manual"
         raw_steps = data.get("steps")
         steps = [str(step).strip() for step in raw_steps if str(step).strip()] if isinstance(raw_steps, list) else []
         return cls(

@@ -14,12 +14,23 @@ ProviderFactory = Callable[[str, Model | None], Provider]
 
 
 def _openai_compatible_provider(provider: str, model: Model | None) -> Provider:
-    if provider == "openai":
-        return OpenAIProvider(use_responses=True)
     return OpenAIProvider(
         provider_name=(model.provider_name or model.provider) if model else provider,
-        api_key_hint=(model.api_key_envs or [f"{provider.upper()}_API_KEY"])[0] if model else f"{provider.upper()}_API_KEY",
+        api_key_hint=(model.api_key_envs or [f"{provider.upper()}_API_KEY"])[0]
+        if model
+        else f"{provider.upper()}_API_KEY",
         default_base_url=model.base_url if model else None,
+    )
+
+
+def _openai_responses_provider(provider: str, model: Model | None) -> Provider:
+    return OpenAIProvider(
+        provider_name=(model.provider_name or model.provider) if model else provider,
+        api_key_hint=(model.api_key_envs or [f"{provider.upper()}_API_KEY"])[0]
+        if model
+        else f"{provider.upper()}_API_KEY",
+        default_base_url=model.base_url if model else None,
+        use_responses=True,
     )
 
 
@@ -44,6 +55,7 @@ def _gemini_provider(provider: str, model: Model | None) -> Provider:
 
 
 PROTOCOL_FACTORIES: dict[str, ProviderFactory] = {
+    "openai-responses": _openai_responses_provider,
     "openai-completions": _openai_compatible_provider,
     "openai-chat-completions": _openai_compatible_provider,
     "anthropic-messages": _anthropic_provider,
@@ -59,7 +71,9 @@ PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
 }
 
 
-def get_provider(provider: str, protocol: str | None = None, model: Model | None = None) -> Provider | None:
+def get_provider(
+    provider: str, protocol: str | None = None, model: Model | None = None
+) -> Provider | None:
     if protocol:
         protocol_factory = PROTOCOL_FACTORIES.get(protocol)
         if protocol_factory:
