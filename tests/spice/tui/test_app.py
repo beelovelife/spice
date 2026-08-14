@@ -12,6 +12,7 @@ from spice.agent.events import (
     AssistantMessageEvent,
     ModelFallbackEvent,
     ModelRetryEvent,
+    ReasoningDeltaEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -28,12 +29,16 @@ def _minimal_tui() -> SpiceTUI:
     tui._message_buffer = Buffer(read_only=True)
     tui._message_follow_tail = True
     tui._message_vertical_scroll = 0
-    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=24, window_width=100))
+    tui._message_window = SimpleNamespace(
+        render_info=SimpleNamespace(window_height=24, window_width=100)
+    )
     tui._response_start = 0
     tui._response_parts = []
     tui._streaming = False
     tui._waiting_started = None
     tui._waiting_start = None
+    tui._waiting_label = "Waiting for model"
+    tui._reasoning_streaming = False
     tui._pending_tool_args = {}
     tui._compact_tool_group = None
     tui._todo_items = []
@@ -59,7 +64,13 @@ def test_tui_keeps_tool_output_between_assistant_segments() -> None:
             tool_calls=[ToolCall(id="tc1", name="update_todo", arguments={})],
         )
     )
-    tui._render_event(ToolExecutionStartEvent(tool_call_id="tc1", tool_name="update_todo", args={"merge": True, "todos": []}))
+    tui._render_event(
+        ToolExecutionStartEvent(
+            tool_call_id="tc1",
+            tool_name="update_todo",
+            args={"merge": True, "todos": []},
+        )
+    )
     tui._render_event(
         ToolExecutionEndEvent(
             tool_call_id="tc1",
@@ -68,7 +79,13 @@ def test_tui_keeps_tool_output_between_assistant_segments() -> None:
                 "",
                 details={
                     "todos": [{"id": "1", "content": "收尾", "status": "completed"}],
-                    "summary": {"total": 1, "completed": 1, "in_progress": 0, "pending": 0, "cancelled": 0},
+                    "summary": {
+                        "total": 1,
+                        "completed": 1,
+                        "in_progress": 0,
+                        "pending": 0,
+                        "cancelled": 0,
+                    },
                 },
             ),
         )
@@ -87,24 +104,48 @@ def test_tui_keeps_tool_output_between_assistant_segments() -> None:
     assert "✓ 1. 收尾" in todo_text
 
 
-def test_tui_renders_thought_label_between_user_and_answer() -> None:
+def test_tui_replaces_waiting_activity_with_answer() -> None:
     tui = _minimal_tui()
 
     tui._render_event(TurnStartEvent(prompt="hello"))
-    assert tui._message_buffer.text == "Thought for 0s\n\n"
+    assert tui._message_buffer.text == "⠋ Waiting for model · 0s\n"
     assert tui._waiting_started is not None
 
     tui._render_event(TextDeltaEvent("你好"))
     tui._render_event(AssistantMessageEvent(text="你好", tool_calls=[]))
 
-    assert tui._message_buffer.text == "Thought for 0s\n\nSpice: 你好\n"
+    assert tui._message_buffer.text == "Spice: 你好\n"
+
+
+def test_tui_streams_reasoning_before_answer() -> None:
+    tui = _minimal_tui()
+
+    tui._render_event(TurnStartEvent(prompt="hello"))
+    tui._render_event(ReasoningDeltaEvent("先检查", kind="reasoning"))
+    tui._render_event(ReasoningDeltaEvent("上下文", kind="reasoning"))
+    tui._render_event(TextDeltaEvent("结论"))
+    tui._render_event(AssistantMessageEvent(text="结论", tool_calls=[]))
+
+    assert tui._message_buffer.text == "Thinking: 先检查上下文\nSpice: 结论\n"
 
 
 def test_tui_shows_retry_fallback_and_fatal_tool_stop() -> None:
     tui = _minimal_tui()
 
     tui._render_event(ModelRetryEvent("openai", "primary", 1, 2, 3, 0.5, "temporary"))
-    tui._render_event(ModelFallbackEvent("primary", "openai", "primary", "backup", "anthropic", "backup", "server", 0, 1))
+    tui._render_event(
+        ModelFallbackEvent(
+            "primary",
+            "openai",
+            "primary",
+            "backup",
+            "anthropic",
+            "backup",
+            "server",
+            0,
+            1,
+        )
+    )
     tui._render_event(AgentErrorEvent("Tool denied by user: bash", kind="fatal_tool"))
 
     rendered = tui._message_buffer.text
@@ -121,7 +162,7 @@ def test_tui_renders_final_text_when_no_delta_was_streamed() -> None:
     tui._render_event(TurnStartEvent(prompt="hello"))
     tui._render_event(AssistantMessageEvent(text="final answer", tool_calls=[]))
 
-    assert tui._message_buffer.text == "Thought for 0s\n\nSpice: final answer\n"
+    assert tui._message_buffer.text == "Spice: final answer\n"
 
 
 def test_tui_turn_gap_keeps_rounds_from_touching() -> None:
@@ -134,7 +175,9 @@ def test_tui_turn_gap_keeps_rounds_from_touching() -> None:
     assert tui._message_buffer.text == "Spice: previous answer\n\nYou: next question\n"
 
 
-def test_tui_activity_status_distinguishes_generation_pause_and_tool(monkeypatch) -> None:
+def test_tui_activity_status_distinguishes_generation_pause_and_tool(
+    monkeypatch,
+) -> None:
     tui = _minimal_tui()
     tui._agent_session = None
     tui._busy = True
@@ -144,18 +187,26 @@ def test_tui_activity_status_distinguishes_generation_pause_and_tool(monkeypatch
     tui._active_tool_name = None
     monkeypatch.setattr("spice.tui.app.time.monotonic", lambda: 105.0)
 
-    assert "".join(text for _, text in tui._mode_fragments()) == " ▌ Generating · 5s"
+    assert "".join(text for _, text in tui._mode_fragments()) == " ⠋ Generating · 5s"
 
     tui._last_stream_delta_at = 102.0
-    assert "".join(text for _, text in tui._mode_fragments()) == " ▌ Waiting for model · 5s"
+    assert (
+        "".join(text for _, text in tui._mode_fragments())
+        == " ⠋ Waiting for model · 5s"
+    )
 
     tui._active_tool_name = "web_search"
-    assert "".join(text for _, text in tui._mode_fragments()) == " ▌ Running web_search · 5s"
+    assert (
+        "".join(text for _, text in tui._mode_fragments())
+        == " ⠋ Running web_search · 5s"
+    )
 
 
 def test_tui_styles_role_labels_and_tool_rows_without_changing_text() -> None:
     tui = _minimal_tui()
-    original = "You: question\n\nSpice: answer\n  tool: web_search()\n  web_search -> done"
+    original = (
+        "You: question\n\nSpice: answer\n  tool: web_search()\n  web_search -> done"
+    )
     tui._append(original)
 
     fragments = tui._message_fragments()
@@ -163,8 +214,14 @@ def test_tui_styles_role_labels_and_tool_rows_without_changing_text() -> None:
     assert "".join(text for _, text in fragments) == original
     assert ("class:message.user-label", "You:") in fragments
     assert ("class:message.assistant-label", "Spice:") in fragments
-    assert any(style == "class:message.tool" and "tool: web_search" in text for style, text in fragments)
-    assert any(style == "class:message.tool-result" and "web_search -> done" in text for style, text in fragments)
+    assert any(
+        style == "class:message.tool" and "tool: web_search" in text
+        for style, text in fragments
+    )
+    assert any(
+        style == "class:message.tool-result" and "web_search -> done" in text
+        for style, text in fragments
+    )
 
 
 def test_tui_markdown_lists_are_compact() -> None:
@@ -178,7 +235,9 @@ def test_tui_markdown_lists_are_compact() -> None:
 def test_tui_markdown_tables_render_as_tables() -> None:
     tui = _minimal_tui()
 
-    rendered = tui._render_markdown_text("| 项目 | 详情 |\n| --- | --- |\n| 天气 | 多云 |\n")
+    rendered = tui._render_markdown_text(
+        "| 项目 | 详情 |\n| --- | --- |\n| 天气 | 多云 |\n"
+    )
 
     assert "项目" in rendered
     assert "详情" in rendered
@@ -205,7 +264,9 @@ def test_tui_compact_uses_agent_session_engine() -> None:
             calls.append(kwargs)
             return SimpleNamespace(tokens_before=100, tokens_after=40)
 
-        tui._agent_session = SimpleNamespace(session=SimpleNamespace(id="session-1"), compact=compact)
+        tui._agent_session = SimpleNamespace(
+            session=SimpleNamespace(id="session-1"), compact=compact
+        )
         await tui._show_compact("focus on tests")
 
         assert calls == [{"focus": "focus on tests", "reason": "manual", "force": True}]
@@ -216,7 +277,9 @@ def test_tui_compact_uses_agent_session_engine() -> None:
 
 def test_tui_scrolls_message_history_off_tail() -> None:
     tui = _minimal_tui()
-    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=3, window_width=80))
+    tui._message_window = SimpleNamespace(
+        render_info=SimpleNamespace(window_height=3, window_width=80)
+    )
     tui._append("\n".join(f"line {index}" for index in range(10)))
 
     assert tui._message_vertical_scroll == 7
@@ -229,7 +292,9 @@ def test_tui_scrolls_message_history_off_tail() -> None:
 
 def test_tui_scrolls_wrapped_message_history_off_tail() -> None:
     tui = _minimal_tui()
-    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=3, window_width=11))
+    tui._message_window = SimpleNamespace(
+        render_info=SimpleNamespace(window_height=3, window_width=11)
+    )
     tui._append("0123456789" * 5)
 
     assert tui._message_display_lines() == ["0123456789"] * 5
@@ -271,9 +336,13 @@ def test_tui_message_content_supports_preferred_height_probe() -> None:
     assert tui._message_cursor_position().y == 20
 
 
-def test_tui_mouse_wheel_scrolls_message_history_from_message_and_input_controls() -> None:
+def test_tui_mouse_wheel_scrolls_message_history_from_message_and_input_controls() -> (
+    None
+):
     tui = _minimal_tui()
-    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=3, window_width=80))
+    tui._message_window = SimpleNamespace(
+        render_info=SimpleNamespace(window_height=3, window_width=80)
+    )
     tui._append("\n".join(f"line {index}" for index in range(10)))
     invalidated = []
     tui._app = SimpleNamespace(invalidate=lambda: invalidated.append(True))
@@ -296,7 +365,9 @@ def test_tui_mouse_wheel_scrolls_message_history_from_message_and_input_controls
 
 def test_tui_mouse_wheel_moves_session_selector_and_keeps_choice_visible() -> None:
     tui = _minimal_tui()
-    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=10, window_width=80))
+    tui._message_window = SimpleNamespace(
+        render_info=SimpleNamespace(window_height=10, window_width=80)
+    )
     tui._session_choices = [f"session-{index}" for index in range(8)]
     tui._session_choice_rows = [
         (session_id, "provider/model", f"details {index}")
@@ -322,9 +393,13 @@ def test_tui_mouse_wheel_moves_session_selector_and_keeps_choice_visible() -> No
     assert "session-7" not in tui._message_buffer.text
 
 
-def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monkeypatch) -> None:
+def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(
+    monkeypatch,
+) -> None:
     tui = _minimal_tui()
-    tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=5, window_width=21))
+    tui._message_window = SimpleNamespace(
+        render_info=SimpleNamespace(window_height=5, window_width=21)
+    )
     tui._provider = None
     tui._model = None
     tui._refresh_completer = lambda: None
@@ -337,7 +412,9 @@ def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monk
         runtime_model_label="provider/model",
         messages=[
             SimpleNamespace(role="user", content="question", tool_calls=None),
-            SimpleNamespace(role="assistant", content="latest answer " * 20, tool_calls=None),
+            SimpleNamespace(
+                role="assistant", content="latest answer " * 20, tool_calls=None
+            ),
         ],
     )
     monkeypatch.setattr("spice.tui.app.AgentSession", lambda **_kwargs: resumed)
@@ -347,7 +424,6 @@ def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monk
     assert "old conversation" not in tui._message_buffer.text
     assert "latest answer" in tui._message_buffer.text
     assert tui._message_follow_tail is True
-
 
     assert tui._message_vertical_scroll == tui._message_bottom_scroll()
     assert tui._message_vertical_scroll > 0
@@ -361,11 +437,14 @@ def test_tui_resume_replaces_old_view_follows_latest_and_remains_scrollable(monk
     assert tui._message_follow_tail is True
 
 
-def test_shared_resume_replaces_view_replays_history_and_resets_policy(monkeypatch) -> None:
+def test_shared_resume_replaces_view_replays_history_and_resets_policy(
+    monkeypatch,
+) -> None:
     async def exercise() -> None:
         tui = SpiceTUI()
         tui._append("old conversation\n")
         tui.confirm_policy.allow_file_edits = True
+        tui.confirm_policy.allow_all_tools = True
         closed = []
 
         class OldSession:
@@ -380,13 +459,20 @@ def test_shared_resume_replaces_view_replays_history_and_resets_policy(monkeypat
             session_label="session-new",
             runtime_model_label="openai/new",
             messages=[
-                SimpleNamespace(role="user", content="restored question", tool_calls=None),
-                SimpleNamespace(role="assistant", content="restored answer", tool_calls=None),
+                SimpleNamespace(
+                    role="user", content="restored question", tool_calls=None
+                ),
+                SimpleNamespace(
+                    role="assistant", content="restored answer", tool_calls=None
+                ),
             ],
             confirm=None,
         )
 
-        monkeypatch.setattr("spice.interactive.commands.replace_session", lambda *_args, **_kwargs: new_session)
+        monkeypatch.setattr(
+            "spice.interactive.commands.replace_session",
+            lambda *_args, **_kwargs: new_session,
+        )
         tui._agent_session = OldSession()
         tui._bind_trace_session = lambda: None
         tui._refresh_completer = lambda: None
@@ -397,6 +483,7 @@ def test_shared_resume_replaces_view_replays_history_and_resets_policy(monkeypat
         assert "restored question" in tui._message_buffer.text
         assert "restored answer" in tui._message_buffer.text
         assert tui.confirm_policy.allow_file_edits is False
+        assert tui.confirm_policy.allow_all_tools is False
         assert closed == [True]
 
     asyncio.run(exercise())
@@ -432,7 +519,9 @@ def test_shared_reset_clears_old_view_before_painting_result() -> None:
 def test_tui_submitting_message_leaves_history_mode_and_follows_response() -> None:
     async def exercise() -> None:
         tui = _minimal_tui()
-        tui._message_window = SimpleNamespace(render_info=SimpleNamespace(window_height=4, window_width=30))
+        tui._message_window = SimpleNamespace(
+            render_info=SimpleNamespace(window_height=4, window_width=30)
+        )
         tui._busy = False
         tui._show_edit_mode_hint = False
         tui._agent_session = SimpleNamespace(
@@ -470,7 +559,9 @@ def test_tui_submitting_message_leaves_history_mode_and_follows_response() -> No
 
 def test_tui_message_history_does_not_take_focus_from_input() -> None:
     tui = _minimal_tui()
-    message_control = _MessageBufferControl(tui, buffer=tui._message_buffer, focusable=False)
+    message_control = _MessageBufferControl(
+        tui, buffer=tui._message_buffer, focusable=False
+    )
     input_control = _InputBufferControl(tui, buffer=Buffer(), focus_on_click=True)
 
     assert message_control.is_focusable() is False

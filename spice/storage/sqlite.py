@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
-FALLBACK_SCHEMA = """
+# Single source of truth for the application-state schema. Keep this constant
+# in sync with the SQLite storage implementations under spice/storage/.
+SCHEMA = """
 pragma foreign_keys = on;
 
 create table if not exists sessions (
@@ -84,7 +88,8 @@ create table if not exists memory_history (
     summary text not null,
     source text not null,
     session_id text not null,
-    metadata_json text not null
+    metadata_json text not null,
+    workspace_id text
 );
 
 create table if not exists memory_distill_state (
@@ -101,6 +106,9 @@ create table if not exists memory_distill_log (
 
 create index if not exists memory_history_session_cursor
     on memory_history(session_id, cursor);
+
+create index if not exists memory_history_workspace_cursor
+    on memory_history(workspace_id, cursor);
 
 create table if not exists artifacts (
     artifact_id text primary key,
@@ -132,16 +140,34 @@ def connect_sqlite(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def open_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a connection that commits on success, rolls back on error, and always closes.
+
+    sqlite3's own connection context manager only manages the transaction, so
+    `with connect_sqlite(...)` leaks the connection (and WAL file handles).
+    """
+    conn = connect_sqlite(db_path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_sqlite_database(db_path: Path) -> None:
-    with connect_sqlite(db_path) as conn:
+    with open_sqlite(db_path) as conn:
         conn.execute("pragma journal_mode=wal")
         conn.execute("pragma synchronous=normal")
+        table_exists = conn.execute(
+            "select 1 from sqlite_master where type = 'table' and name = 'memory_history'"
+        ).fetchone()
+        if table_exists is not None:
+            columns = {str(row[1]) for row in conn.execute("pragma table_info(memory_history)")}
+            if "workspace_id" not in columns:
+                conn.execute("alter table memory_history add column workspace_id text")
         conn.executescript(sqlite_schema())
 
 
 def sqlite_schema() -> str:
-    docs_schema = Path(__file__).resolve().parents[2] / "docs" / "sql" / "sqlite.sql"
-    try:
-        return docs_schema.read_text(encoding="utf-8")
-    except OSError:
-        return FALLBACK_SCHEMA
+    return SCHEMA

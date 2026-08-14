@@ -122,7 +122,8 @@ def build_model_route(
     options_factory: Callable[[Model], ModelRequestOptions],
 ) -> ModelRoute:
     retry_policy = ModelRetryPolicy.from_settings(routing_settings.get("retry"))
-    fallback = routing_settings.get("fallback") if isinstance(routing_settings.get("fallback"), dict) else {}
+    raw_fallback = routing_settings.get("fallback")
+    fallback = raw_fallback if isinstance(raw_fallback, dict) else {}
     fallback_enabled = bool(fallback.get("enabled", False))
     models = [primary]
     seen = {(primary.provider, primary.id)}

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from spice.llm.messages import Message
-from spice.tools.base import ToolResult, truncate_head
+from spice.tools.base import ToolResult, truncate_head_tail
 
 MAX_INLINE_TOOL_OUTPUT = 12_000
 
@@ -53,19 +53,21 @@ def prepare_tool_message_for_session(message: Message, *, cwd: Path, session_id:
         return message
     metadata = dict(message.metadata)
     tool_meta = dict(metadata.get("tool_result") or {})
+    full_content = metadata.pop("_full_tool_output", None)
+    source_content = full_content if isinstance(full_content, str) else message.content
     content = message.content
-    if len(content) > MAX_INLINE_TOOL_OUTPUT:
+    if len(source_content) > MAX_INLINE_TOOL_OUTPUT:
         artifact_path = _artifact_path(cwd, session_id, message.tool_call_id or "tool")
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_text(content, encoding="utf-8")
+        artifact_path.write_text(source_content, encoding="utf-8")
         content = (
-            truncate_head(content, MAX_INLINE_TOOL_OUTPUT)
+            truncate_head_tail(source_content, MAX_INLINE_TOOL_OUTPUT)
             + f"\n\n[tool output truncated] Full output saved to {artifact_path}"
         )
         tool_meta.update(
             {
                 "truncated": True,
-                "original_chars": len(message.content),
+                "original_chars": len(source_content),
                 "artifact_path": str(artifact_path),
             }
         )

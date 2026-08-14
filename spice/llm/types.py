@@ -5,6 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from spice.llm.usage import TokenUsage
+
+StreamErrorKind = Literal[
+    "network",
+    "timeout",
+    "rate_limit",
+    "server",
+    "authentication",
+    "invalid_request",
+    "unsupported",
+    "cancelled",
+    "unknown",
+]
+
 
 class StreamEvent:
     """Base class for provider events."""
@@ -13,6 +27,14 @@ class StreamEvent:
 @dataclass
 class TextDelta(StreamEvent):
     text: str
+
+
+@dataclass
+class ReasoningDelta(StreamEvent):
+    """Ephemeral reasoning output for display, never provider conversation history."""
+
+    text: str
+    kind: Literal["reasoning", "summary"] = "reasoning"
 
 
 @dataclass
@@ -25,23 +47,13 @@ class ToolCallEvent(StreamEvent):
 @dataclass
 class Done(StreamEvent):
     finish_reason: str | None = None
-    usage: dict[str, Any] | None = None
+    usage: TokenUsage | None = None
 
 
 @dataclass
 class StreamError(StreamEvent):
     error: str
-    kind: Literal[
-        "network",
-        "timeout",
-        "rate_limit",
-        "server",
-        "authentication",
-        "invalid_request",
-        "unsupported",
-        "cancelled",
-        "unknown",
-    ] = "unknown"
+    kind: StreamErrorKind = "unknown"
     retryable: bool = False
     status_code: int | None = None
     retry_after_seconds: float | None = None

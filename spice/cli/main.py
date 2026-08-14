@@ -13,24 +13,39 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 import typer
-
 from spice.version import __version__
 from spice.agent.agent_session import AgentSession
-from spice.agent.debug_trace import trace_path
-from spice.agent.logging_config import configure_logging, log_path
+from spice.agent.logging_config import configure_logging, log_level_name, log_path
 from spice.agent.memory import MemoryDistiller, MemoryStore
-from spice.agent.sessions import SessionInfo, SessionStore
+from spice.agent.sessions import SessionInfo, SessionStoreProtocol
 from spice.agent.tool_results import tool_display_text
-from spice.agent.trace import DEFAULT_TRACE_PATH, RunTraceWriter
+from spice.agent.trace import attach_trace_writer
 from spice.cli.process import set_process_title
 from spice.cli.render import CliRenderer
-from spice.cli.run_interactive import render_prompt, run_conversation
-from spice.llm.config import SECRETS_PATH, SETTINGS_PATH, get_api_key, load_config, save_config, save_secret
+from spice.cli.run_interactive import run_prompt, run_conversation
+from spice.cli.trace_inspector import TraceInspectionError, render_trace
+from spice.llm.config import (
+    SECRETS_PATH,
+    SETTINGS_PATH,
+    get_api_key,
+    load_config,
+    save_config,
+    save_secret,
+    _read_json,
+    _write_private_json,
+)
+from spice.mcp.config import load_mcp_config
+from spice.mcp.manager import McpManager
+from spice.mcp.trust import McpTrustStore
 from spice.llm.model_registry import ModelRegistry, find_initial_model
 from spice.llm.types import ModelRequestOptions
 from spice.sandbox.factory import create_environment, create_workspace_policy
-from spice.skills.loader import load_skills, read_skill_file
-from spice.storage.factory import create_memory_store, create_session_store, storage_backend
+from spice.skills.loader import load_skills, read_skill_content
+from spice.storage.factory import (
+    create_memory_store,
+    create_session_store,
+    storage_backend,
+)
 from spice.storage.sqlite import init_sqlite_database
 from spice.tui import run_tui
 
@@ -46,29 +61,40 @@ skills_app = typer.Typer(help="Inspect Spice skills.")
 memory_app = typer.Typer(help="Manage Spice memory.")
 sandbox_app = typer.Typer(help="Manage Spice sandbox execution.")
 storage_app = typer.Typer(help="Manage Spice application-state storage.")
+trace_app = typer.Typer(help="Inspect Spice runtime traces.")
+mcp_app = typer.Typer(help="Manage Model Context Protocol servers.")
 app.add_typer(config_app, name="config")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(skills_app, name="skills")
 app.add_typer(memory_app, name="memory")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(storage_app, name="storage")
+app.add_typer(trace_app, name="trace")
+app.add_typer(mcp_app, name="mcp")
 
 console = Console()
 
 
-def _create_session_store(*, cwd: Path | None):
-    config = load_config()
-    if storage_backend(config) == "sqlite":
-        return create_session_store(config, cwd=cwd)
-    return SessionStore(cwd=cwd)
+def _create_session_store(*, cwd: Path | None) -> SessionStoreProtocol:
+    return create_session_store(load_config(), cwd=cwd)
 
 
 @app.callback()
 def main(
     ctx: typer.Context,
-    version: Annotated[bool, typer.Option("--version", "-v", help="Show Spice version.")] = False,
-    markdown: Annotated[bool, typer.Option("--markdown/--no-markdown", help="Render Markdown-friendly streaming output.")] = True,
-    debug: Annotated[bool, typer.Option("--debug", help="Enable debug logging.")] = False,
+    version: Annotated[
+        bool, typer.Option("--version", "-v", help="Show Spice version.")
+    ] = False,
+    markdown: Annotated[
+        bool,
+        typer.Option(
+            "--markdown/--no-markdown",
+            help="Render Markdown-friendly streaming output.",
+        ),
+    ] = True,
+    debug: Annotated[
+        bool, typer.Option("--debug", help="Enable debug logging.")
+    ] = False,
 ) -> None:
     """Run Spice. Without a subcommand, enter the interactive terminal."""
     configure_logging(debug=debug)
@@ -82,11 +108,38 @@ def main(
 
 @app.command()
 def chat(
-    provider: Annotated[str | None, typer.Option("--provider", "-p", help="Provider name.")] = None,
-    model: Annotated[str | None, typer.Option("--model", "-m", help="Model id.")] = None,
-    session_id: Annotated[str | None, typer.Option("--session", "-s", help="Continue a session by id.")] = None,
-    continue_session: Annotated[bool, typer.Option("--continue", "-c", help="Continue the latest session for this cwd.")] = False,
-    markdown: Annotated[bool, typer.Option("--markdown/--no-markdown", help="Render Markdown-friendly streaming output.")] = True,
+    provider: Annotated[
+        str | None, typer.Option("--provider", "-p", help="Provider name.")
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option("--model", "-m", help="Model id.")
+    ] = None,
+    session_id: Annotated[
+        str | None, typer.Option("--session", "-s", help="Continue a session by id.")
+    ] = None,
+    continue_session: Annotated[
+        bool,
+        typer.Option(
+            "--continue", "-c", help="Continue the latest session for this cwd."
+        ),
+    ] = False,
+    markdown: Annotated[
+        bool,
+        typer.Option(
+            "--markdown/--no-markdown",
+            help="Render Markdown-friendly streaming output.",
+        ),
+    ] = True,
+    trace: Annotated[
+        bool,
+        typer.Option(
+            "--trace/--no-trace", help="Write a runtime trace for this CLI invocation."
+        ),
+    ] = False,
+    trace_file: Annotated[
+        Path | None,
+        typer.Option("--trace-file", help="Trace output path. Implies --trace."),
+    ] = None,
 ) -> None:
     """Enter the interactive terminal."""
     asyncio.run(
@@ -97,16 +150,39 @@ def chat(
             session_id=session_id,
             continue_session=continue_session,
             markdown=markdown,
+            trace=trace or trace_file is not None,
+            trace_file=trace_file,
         )
     )
 
 
 @app.command()
 def tui(
-    provider: Annotated[str | None, typer.Option("--provider", "-p", help="Provider name.")] = None,
-    model: Annotated[str | None, typer.Option("--model", "-m", help="Model id.")] = None,
-    session_id: Annotated[str | None, typer.Option("--session", "-s", help="Continue a session by id.")] = None,
-    continue_session: Annotated[bool, typer.Option("--continue", "-c", help="Continue the latest session for this cwd.")] = False,
+    provider: Annotated[
+        str | None, typer.Option("--provider", "-p", help="Provider name.")
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option("--model", "-m", help="Model id.")
+    ] = None,
+    session_id: Annotated[
+        str | None, typer.Option("--session", "-s", help="Continue a session by id.")
+    ] = None,
+    continue_session: Annotated[
+        bool,
+        typer.Option(
+            "--continue", "-c", help="Continue the latest session for this cwd."
+        ),
+    ] = False,
+    trace: Annotated[
+        bool,
+        typer.Option(
+            "--trace/--no-trace", help="Write a runtime trace for this TUI invocation."
+        ),
+    ] = False,
+    trace_file: Annotated[
+        Path | None,
+        typer.Option("--trace-file", help="Trace output path. Implies --trace."),
+    ] = None,
 ) -> None:
     """Enter the full-screen TUI with a fixed bottom input."""
     run_tui(
@@ -114,19 +190,46 @@ def tui(
         model=model,
         session_id=session_id,
         continue_session=continue_session,
+        trace=trace or trace_file is not None,
+        trace_file=trace_file,
     )
 
 
 @app.command()
 def run(
     prompt: Annotated[str, typer.Argument(help="Prompt to run once.")],
-    provider: Annotated[str | None, typer.Option("--provider", "-p", help="Provider name.")] = None,
-    model: Annotated[str | None, typer.Option("--model", "-m", help="Model id.")] = None,
-    session_id: Annotated[str | None, typer.Option("--session", "-s", help="Continue a session by id.")] = None,
-    continue_session: Annotated[bool, typer.Option("--continue", "-c", help="Continue the latest session for this cwd.")] = False,
-    markdown: Annotated[bool, typer.Option("--markdown/--no-markdown", help="Render Markdown-friendly streaming output.")] = True,
-    trace: Annotated[bool, typer.Option("--trace/--no-trace", help="Write a runtime trace JSON file.")] = False,
-    trace_file: Annotated[Path | None, typer.Option("--trace-file", help="Runtime trace output path. Implies --trace.")] = None,
+    provider: Annotated[
+        str | None, typer.Option("--provider", "-p", help="Provider name.")
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option("--model", "-m", help="Model id.")
+    ] = None,
+    session_id: Annotated[
+        str | None, typer.Option("--session", "-s", help="Continue a session by id.")
+    ] = None,
+    continue_session: Annotated[
+        bool,
+        typer.Option(
+            "--continue", "-c", help="Continue the latest session for this cwd."
+        ),
+    ] = False,
+    markdown: Annotated[
+        bool,
+        typer.Option(
+            "--markdown/--no-markdown",
+            help="Render Markdown-friendly streaming output.",
+        ),
+    ] = True,
+    trace: Annotated[
+        bool,
+        typer.Option("--trace/--no-trace", help="Write a runtime trace JSON file."),
+    ] = False,
+    trace_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--trace-file", help="Runtime trace output path. Implies --trace."
+        ),
+    ] = None,
 ) -> None:
     """Run a single prompt."""
     renderer = CliRenderer(console, markdown=markdown)
@@ -145,27 +248,177 @@ def run(
     except ValueError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from exc
-    trace_writer = None
     if trace or trace_file is not None:
-        trace_path = trace_file or DEFAULT_TRACE_PATH
-        trace_writer = RunTraceWriter(trace_path, agent_session)
-        agent_session.subscribe(trace_writer.record)
+        _trace_writer, trace_path = attach_trace_writer(agent_session, path=trace_file)
         console.print(f"[dim]Trace: {trace_path}[/dim]")
     console.print(f"[dim]Session: {agent_session.session_label}[/dim]")
-    asyncio.run(render_prompt(agent_session, renderer, prompt))
+    asyncio.run(_run_once(agent_session, renderer, prompt))
+
+
+async def _run_once(
+    agent_session: AgentSession, renderer: CliRenderer, prompt: str
+) -> None:
+    try:
+        await run_prompt(agent_session, renderer, prompt)
+    finally:
+        close = getattr(agent_session, "aclose", None)
+        if close is not None:
+            await close()
 
 
 @app.command()
 def models() -> None:
     """Show available models and current configuration."""
     config = load_config()
-    table = Table("Provider", "Model", "Current", "API key")
+    table = Table("Provider", "Model", "Protocol", "Current", "API key")
     registry = ModelRegistry()
     for model in registry.all():
-        current = "yes" if model.provider == config.provider and model.id == config.model else ""
+        current = (
+            "yes"
+            if model.provider == config.provider and model.id == config.model
+            else ""
+        )
         key = "yes" if get_api_key(model.provider, env_names=model.api_key_envs) else ""
-        table.add_row(model.provider, model.id, current, key)
+        table.add_row(
+            model.provider, model.id, model.protocol or "default", current, key
+        )
     console.print(table)
+
+
+@mcp_app.command("list")
+def mcp_list() -> None:
+    """List configured MCP servers without connecting."""
+    result = load_mcp_config(Path.cwd())
+    table = Table("Server", "Enabled", "Transport", "Source", "Endpoint")
+    for name, server in sorted(result.servers.items()):
+        endpoint = (
+            " ".join([server.command or "", *server.args]).strip()
+            if server.transport == "stdio"
+            else server.url or ""
+        )
+        table.add_row(
+            name, str(server.enabled), server.transport, server.source, endpoint
+        )
+    if result.servers:
+        console.print(table)
+    else:
+        console.print("No MCP servers configured.")
+    for error in result.errors:
+        console.print(f"[yellow]Config warning:[/yellow] {error}")
+
+
+@mcp_app.command("add")
+def mcp_add(
+    name: str,
+    command: Annotated[
+        str | None, typer.Option("--command", help="Stdio executable.")
+    ] = None,
+    url: Annotated[
+        str | None, typer.Option("--url", help="Streamable HTTP endpoint.")
+    ] = None,
+    args: Annotated[
+        list[str] | None,
+        typer.Option("--arg", help="Stdio argument; repeat for multiple values."),
+    ] = None,
+) -> None:
+    """Add or replace a global MCP server."""
+    if bool(command) == bool(url):
+        raise typer.BadParameter("Provide exactly one of --command or --url.")
+    data = _read_json(SETTINGS_PATH)
+    servers = data.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise typer.BadParameter("settings.json mcpServers must be an object")
+    server: dict[str, object] = {"enabled": True}
+    if command:
+        server.update({"command": command, "args": list(args or [])})
+    else:
+        server["url"] = url
+    servers[name] = server
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _write_private_json(SETTINGS_PATH, data)
+    console.print(f"Added MCP server {name}.")
+
+
+@mcp_app.command("remove")
+def mcp_remove(name: str) -> None:
+    """Remove a global MCP server."""
+    data = _read_json(SETTINGS_PATH)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or name not in servers:
+        raise typer.BadParameter(f"Global MCP server not found: {name}")
+    del servers[name]
+    _write_private_json(SETTINGS_PATH, data)
+    console.print(f"Removed MCP server {name}.")
+
+
+def _set_mcp_enabled(name: str, enabled: bool) -> None:
+    data = _read_json(SETTINGS_PATH)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or not isinstance(servers.get(name), dict):
+        raise typer.BadParameter(f"Global MCP server not found: {name}")
+    servers[name]["enabled"] = enabled
+    _write_private_json(SETTINGS_PATH, data)
+    console.print(f"{'Enabled' if enabled else 'Disabled'} MCP server {name}.")
+
+
+@mcp_app.command("enable")
+def mcp_enable(name: str) -> None:
+    """Enable a global MCP server."""
+    _set_mcp_enabled(name, True)
+
+
+@mcp_app.command("disable")
+def mcp_disable(name: str) -> None:
+    """Disable a global MCP server."""
+    _set_mcp_enabled(name, False)
+
+
+@mcp_app.command("trust")
+def mcp_trust(name: str) -> None:
+    """Trust the current project's configured stdio command."""
+    result = load_mcp_config(Path.cwd())
+    server = result.servers.get(name)
+    if server is None or server.source != "project" or server.transport != "stdio":
+        raise typer.BadParameter("Trust applies only to project stdio MCP servers.")
+    McpTrustStore().trust(Path.cwd(), server)
+    console.print(f"Trusted project MCP server {name} for this configuration.")
+
+
+async def _inspect_mcp(name: str, *, show_tools: bool) -> None:
+    renderer = CliRenderer(console)
+    manager = McpManager(cwd=Path.cwd(), confirm=renderer.confirm)
+    try:
+        await manager.ensure_connected({name})
+        status = next((item for item in manager.status() if item.name == name), None)
+        if status is None:
+            raise typer.BadParameter(f"MCP server not found: {name}")
+        if status.state not in {"connected", "degraded"}:
+            console.print(f"[red]{name}: {status.state}[/red] {status.error}")
+            raise typer.Exit(1)
+        console.print(f"[green]{name}: connected[/green] ({status.tool_count} tools)")
+        if show_tools:
+            table = Table("Tool", "Confirmation", "Description")
+            prefix = f"mcp__{name}__"
+            for tool in manager.tools():
+                if tool.name.startswith(prefix):
+                    table.add_row(
+                        tool.name, str(tool.requires_confirmation), tool.description
+                    )
+            console.print(table)
+    finally:
+        await manager.close()
+
+
+@mcp_app.command("test")
+def mcp_test(name: str) -> None:
+    """Connect to and test an MCP server."""
+    asyncio.run(_inspect_mcp(name, show_tools=False))
+
+
+@mcp_app.command("tools")
+def mcp_tools(name: str) -> None:
+    """Connect and list tools discovered from an MCP server."""
+    asyncio.run(_inspect_mcp(name, show_tools=True))
 
 
 @sandbox_app.command("status")
@@ -181,7 +434,11 @@ def sandbox_init() -> None:
 
 
 @sandbox_app.command("exec")
-def sandbox_exec(command: Annotated[str, typer.Argument(help="Command to run inside the configured sandbox.")]) -> None:
+def sandbox_exec(
+    command: Annotated[
+        str, typer.Argument(help="Command to run inside the configured sandbox.")
+    ],
+) -> None:
     """Run one command through the configured sandbox."""
     asyncio.run(_sandbox_exec(command))
 
@@ -196,7 +453,9 @@ def sandbox_stop() -> None:
 def memory_status() -> None:
     """Show memory distillation status."""
     config = load_config()
-    _print_memory_status(create_memory_store(config), enabled=config.memory_enabled)
+    _print_memory_status(
+        create_memory_store(config, workspace=Path.cwd()), enabled=config.memory_enabled
+    )
 
 
 @memory_app.command("enable")
@@ -218,17 +477,39 @@ def memory_disable() -> None:
 
 
 @memory_app.command("distill")
-def memory_distill() -> None:
-    """Distill history summaries into long-term memory."""
+def memory_distill(
+    scope: Annotated[
+        str,
+        typer.Option(
+            "--scope",
+            help="Target scope: project, global (USER.md + MEMORY.md), or all.",
+        ),
+    ] = "all",
+) -> None:
+    """Distill this workspace's history summaries into long-term memory."""
     config = load_config()
-    store = create_memory_store(config)
+    store = create_memory_store(config, workspace=Path.cwd())
     if not config.memory_enabled:
-        console.print("[yellow]Long-term memory is disabled. Run `spice memory enable` first.[/yellow]")
+        console.print(
+            "[yellow]Long-term memory is disabled. Run `spice memory enable` first.[/yellow]"
+        )
         raise typer.Exit(1)
+    allowed_targets = {
+        "project": {"project"},
+        "global": {"user", "memory"},
+        "all": {"user", "memory", "project"},
+    }.get(scope.lower())
+    if allowed_targets is None:
+        console.print(
+            "[bold red]Error:[/bold red] --scope must be project, global, or all."
+        )
+        raise typer.Exit(2)
     registry = ModelRegistry()
     resolved = find_initial_model(registry, config)
     if not resolved.model:
-        console.print(f"[bold red]Error:[/bold red] {resolved.message or 'No model configured.'}")
+        console.print(
+            f"[bold red]Error:[/bold red] {resolved.message or 'No model configured.'}"
+        )
         raise typer.Exit(1)
     model = resolved.model
     options = ModelRequestOptions(
@@ -238,12 +519,18 @@ def memory_distill() -> None:
         base_url=config.base_url or model.base_url,
     )
     try:
-        result = asyncio.run(MemoryDistiller(store, model=model, options=options).run())
+        result = asyncio.run(
+            MemoryDistiller(
+                store, model=model, options=options, allowed_targets=allowed_targets
+            ).run()
+        )
     except Exception as exc:
         console.print(f"[bold red]Memory distillation failed:[/bold red] {exc}")
         raise typer.Exit(1) from exc
     if result.get("success") is False:
-        console.print(f"[bold red]Memory distillation failed:[/bold red] {result.get('message', 'Plan could not be fully applied.')}")
+        console.print(
+            f"[bold red]Memory distillation failed:[/bold red] {result.get('message', 'Plan could not be fully applied.')}"
+        )
         raise typer.Exit(1)
     if result.get("processed", 0) == 0:
         console.print(result.get("message", "No unprocessed memory history."))
@@ -256,7 +543,8 @@ def memory_distill() -> None:
         f"adds={result.get('adds', 0)} replacements={result.get('replacements', 0)} "
         f"removals={result.get('removals', 0)} skipped={result.get('skipped', 0)}"
     )
-    cleanup = result.get("cleanup") if isinstance(result.get("cleanup"), dict) else {}
+    raw_cleanup = result.get("cleanup")
+    cleanup = raw_cleanup if isinstance(raw_cleanup, dict) else {}
     if cleanup.get("removed"):
         console.print(f"history cleanup removed {cleanup.get('removed')} entries.")
 
@@ -265,19 +553,27 @@ def _print_memory_status(store: MemoryStore, *, enabled: bool) -> None:
     status = store.status()
     table = Table("Metric", "Value")
     table.add_row("enabled", str(enabled).lower())
-    table.add_row("history entries", f"{status['history_count']}/{status['history_limit']}")
+    table.add_row(
+        "history entries", f"{status['history_count']}/{status['history_limit']}"
+    )
     table.add_row("processed cursor", str(status["processed_cursor"]))
     table.add_row("unprocessed entries", str(status["unprocessed_count"]))
     table.add_row("next distill batch", str(status["next_distill_batch"]))
     table.add_row("USER.md usage", str(status["user_usage"]))
     table.add_row("MEMORY.md usage", str(status["memory_usage"]))
+    table.add_row("project MEMORY.md usage", str(status.get("project_usage") or "n/a"))
+    table.add_row("workspace", str(status.get("workspace") or "n/a"))
     console.print(table)
 
 
 @app.command()
 def logs(
-    tail: Annotated[int, typer.Option("--tail", "-n", help="Number of log lines to show.")] = 80,
-    path_only: Annotated[bool, typer.Option("--path", help="Only print the log file path.")] = False,
+    tail: Annotated[
+        int, typer.Option("--tail", "-n", help="Number of log lines to show.")
+    ] = 80,
+    path_only: Annotated[
+        bool, typer.Option("--path", help="Only print the log file path.")
+    ] = False,
 ) -> None:
     """Show the Spice runtime log path and recent lines."""
     path = log_path()
@@ -285,6 +581,7 @@ def logs(
         console.print(str(path))
         return
     console.print(f"[dim]Log file:[/dim] {path}")
+    console.print(f"[dim]Log level:[/dim] {log_level_name()}")
     if not path.exists():
         console.print("[yellow]No log file yet.[/yellow]")
         return
@@ -298,6 +595,36 @@ def logs(
         raise typer.Exit(1) from exc
     for line in lines:
         console.print(line)
+
+
+@trace_app.command("inspect")
+def trace_inspect(
+    path: Annotated[
+        Path, typer.Argument(help="Trace JSON generated by `spice run --trace-file`.")
+    ],
+    step: Annotated[
+        int | None, typer.Option("--step", help="Show one 1-based assistant step.")
+    ] = None,
+    events: Annotated[
+        bool, typer.Option("--events", help="Show the complete event timeline.")
+    ] = False,
+    full: Annotated[
+        bool,
+        typer.Option(
+            "--full", help="Do not truncate assistant and tool output previews."
+        ),
+    ] = False,
+) -> None:
+    """Inspect a Spice runtime trace without executing anything."""
+    try:
+        data = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        render_trace(data, console, step=step, show_events=events, full=full)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Error:[/bold red] Trace file not found: {path}")
+        raise typer.Exit(1) from exc
+    except (OSError, json.JSONDecodeError, TraceInspectionError) as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(1) from exc
 
 
 @skills_app.command("list")
@@ -323,11 +650,16 @@ def skills_list() -> None:
 @skills_app.command("view")
 def skills_view(
     name: Annotated[str, typer.Argument(help="Skill name.")],
-    file_path: Annotated[str | None, typer.Option("--file", "-f", help="Linked file path inside the skill directory.")] = None,
+    file_path: Annotated[
+        str | None,
+        typer.Option(
+            "--file", "-f", help="Linked file path inside the skill directory."
+        ),
+    ] = None,
 ) -> None:
     """Show a skill SKILL.md or linked file."""
     try:
-        console.print(read_skill_file(name, file_path, cwd=Path.cwd()))
+        console.print(read_skill_content(name, file_path, cwd=Path.cwd()))
     except ValueError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from exc
@@ -354,18 +686,28 @@ def skills_doctor() -> None:
 @app.command()
 def resume(
     session_id: Annotated[str, typer.Argument(help="Session id to resume.")],
-    provider: Annotated[str | None, typer.Option("--provider", "-p", help="Provider name.")] = None,
-    model: Annotated[str | None, typer.Option("--model", "-m", help="Model id.")] = None,
+    provider: Annotated[
+        str | None, typer.Option("--provider", "-p", help="Provider name.")
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option("--model", "-m", help="Model id.")
+    ] = None,
 ) -> None:
     """Resume an interactive session by id."""
-    asyncio.run(run_conversation(console, provider=provider, model=model, session_id=session_id))
+    asyncio.run(
+        run_conversation(console, provider=provider, model=model, session_id=session_id)
+    )
 
 
 @sessions_app.callback()
 def sessions(
     ctx: typer.Context,
-    limit: Annotated[int, typer.Option("--limit", "-n", help="Number of sessions to show.")] = 20,
-    all_cwd: Annotated[bool, typer.Option("--all", help="Show sessions from every cwd.")] = False,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", help="Number of sessions to show.")
+    ] = 20,
+    all_cwd: Annotated[
+        bool, typer.Option("--all", help="Show sessions from every cwd.")
+    ] = False,
 ) -> None:
     """List sessions."""
     if ctx.invoked_subcommand is not None:
@@ -392,7 +734,9 @@ def sessions(
 @sessions_app.command("show")
 def sessions_show(
     session_id: Annotated[str, typer.Argument(help="Session id to show.")],
-    tree: Annotated[bool, typer.Option("--tree", help="Show all entries as a tree.")] = False,
+    tree: Annotated[
+        bool, typer.Option("--tree", help="Show all entries as a tree.")
+    ] = False,
     raw: Annotated[bool, typer.Option("--raw", help="Show raw JSONL entries.")] = False,
 ) -> None:
     """Show history for a session."""
@@ -428,12 +772,16 @@ def sessions_rewind(
     except ValueError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from exc
-    console.print(f"[green]Rewound session:[/green] {updated.id} -> {updated.leaf_id} [dim](marker {marker_id})[/dim]")
+    console.print(
+        f"[green]Rewound session:[/green] {updated.id} -> {updated.leaf_id} [dim](marker {marker_id})[/dim]"
+    )
 
 
 @sessions_app.command("stats")
 def sessions_stats(
-    all_cwd: Annotated[bool, typer.Option("--all", help="Count sessions from every cwd.")] = False,
+    all_cwd: Annotated[
+        bool, typer.Option("--all", help="Count sessions from every cwd.")
+    ] = False,
 ) -> None:
     """Show session counts."""
     store = _create_session_store(cwd=None if all_cwd else Path.cwd())
@@ -469,15 +817,21 @@ def sessions_workspaces() -> None:
         if row.updated_at > str(item["latest"]):
             item["latest"] = row.updated_at
     table = Table("CWD", "Sessions", "Empty", "Latest")
-    for cwd, item in sorted(stats.items(), key=lambda pair: str(pair[1]["latest"]), reverse=True):
-        table.add_row(cwd, str(item["sessions"]), str(item["empty"]), str(item["latest"]))
+    for cwd, item in sorted(
+        stats.items(), key=lambda pair: str(pair[1]["latest"]), reverse=True
+    ):
+        table.add_row(
+            cwd, str(item["sessions"]), str(item["empty"]), str(item["latest"])
+        )
     console.print(table)
 
 
 @sessions_app.command("delete")
 def sessions_delete(
     session_id: Annotated[str, typer.Argument(help="Session id to delete.")],
-    yes: Annotated[bool, typer.Option("--yes", "-y", help="Delete without prompting.")] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Delete without prompting.")
+    ] = False,
 ) -> None:
     """Delete one session."""
     store = _create_session_store(cwd=Path.cwd())
@@ -486,7 +840,9 @@ def sessions_delete(
     except ValueError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from exc
-    if not yes and not typer.confirm(f"Delete session {info.id}? This cannot be undone.", default=False):
+    if not yes and not typer.confirm(
+        f"Delete session {info.id}? This cannot be undone.", default=False
+    ):
         console.print("Cancelled.")
         return
     try:
@@ -499,13 +855,37 @@ def sessions_delete(
 
 @sessions_app.command("prune")
 def sessions_prune(
-    all_cwd: Annotated[bool, typer.Option("--all", help="Prune sessions from every cwd.")] = False,
-    keep_recent: Annotated[int | None, typer.Option("--keep-recent", help="Keep the newest N sessions and prune the rest.")] = None,
-    before: Annotated[str | None, typer.Option("--before", help="Prune sessions updated before this date/time.")] = None,
-    start: Annotated[str | None, typer.Option("--from", help="Prune sessions updated at or after this date/time.")] = None,
-    end: Annotated[str | None, typer.Option("--to", help="Prune sessions updated before or at this date/time.")] = None,
-    all_sessions: Annotated[bool, typer.Option("--all-sessions", help="Prune every session in scope.")] = False,
-    yes: Annotated[bool, typer.Option("--yes", "-y", help="Actually delete the selected sessions.")] = False,
+    all_cwd: Annotated[
+        bool, typer.Option("--all", help="Prune sessions from every cwd.")
+    ] = False,
+    keep_recent: Annotated[
+        int | None,
+        typer.Option(
+            "--keep-recent", help="Keep the newest N sessions and prune the rest."
+        ),
+    ] = None,
+    before: Annotated[
+        str | None,
+        typer.Option("--before", help="Prune sessions updated before this date/time."),
+    ] = None,
+    start: Annotated[
+        str | None,
+        typer.Option(
+            "--from", help="Prune sessions updated at or after this date/time."
+        ),
+    ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option(
+            "--to", help="Prune sessions updated before or at this date/time."
+        ),
+    ] = None,
+    all_sessions: Annotated[
+        bool, typer.Option("--all-sessions", help="Prune every session in scope.")
+    ] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Actually delete the selected sessions.")
+    ] = False,
 ) -> None:
     """Preview or delete sessions by retention rule."""
     selected_rules = sum(
@@ -517,20 +897,31 @@ def sessions_prune(
         ]
     )
     if selected_rules != 1:
-        raise typer.BadParameter("Choose exactly one rule: --keep-recent, --before, --from/--to, or --all-sessions.")
+        raise typer.BadParameter(
+            "Choose exactly one rule: --keep-recent, --before, --from/--to, or --all-sessions."
+        )
     if keep_recent is not None and keep_recent < 0:
         raise typer.BadParameter("--keep-recent must be >= 0.")
 
     store = _create_session_store(cwd=None if all_cwd else Path.cwd())
     rows = _session_rows(store, all_cwd=all_cwd)
-    candidates = _prune_candidates(rows, keep_recent=keep_recent, before=before, start=start, end=end, all_sessions=all_sessions)
+    candidates = _prune_candidates(
+        rows,
+        keep_recent=keep_recent,
+        before=before,
+        start=start,
+        end=end,
+        all_sessions=all_sessions,
+    )
     _print_prune_preview(candidates, all_cwd=all_cwd)
     if not candidates:
         return
     if not yes:
         console.print("Dry run only. Use --yes to delete these sessions.")
         return
-    if not typer.confirm(f"Delete {len(candidates)} sessions? This cannot be undone.", default=False):
+    if not typer.confirm(
+        f"Delete {len(candidates)} sessions? This cannot be undone.", default=False
+    ):
         console.print("Cancelled.")
         return
     deleted = 0
@@ -548,7 +939,9 @@ def sessions_prune(
 def storage_init(
     backend: Annotated[
         str | None,
-        typer.Argument(help="Storage backend to initialize without changing settings.json. Defaults to settings.json."),
+        typer.Argument(
+            help="Storage backend to initialize without changing settings.json. Defaults to settings.json."
+        ),
     ] = None,
 ) -> None:
     """Initialize application-state storage without changing settings."""
@@ -561,15 +954,21 @@ def storage_init(
         console.print("[green]File storage needs no database initialization.[/green]")
         return
     if selected_backend != "sqlite":
-        console.print(f"[bold red]Error:[/bold red] unsupported storage backend: {selected_backend}")
+        console.print(
+            f"[bold red]Error:[/bold red] unsupported storage backend: {selected_backend}"
+        )
         raise typer.Exit(1)
-    sqlite_path = Path(str(config.storage.get("sqlitePath") or "~/.spice/spice.db")).expanduser()
+    sqlite_path = Path(
+        str(config.storage.get("sqlitePath") or "~/.spice/spice.db")
+    ).expanduser()
     init_sqlite_database(sqlite_path)
     console.print(f"[green]Initialized SQLite storage:[/green] {sqlite_path}")
 
 
-def _session_rows(store: SessionStore, *, all_cwd: bool) -> list[SessionInfo]:
-    return store.list(limit=1_000_000, cwd=None if all_cwd else Path.cwd(), include_empty=True)
+def _session_rows(store: SessionStoreProtocol, *, all_cwd: bool) -> list[SessionInfo]:
+    return store.list(
+        limit=1_000_000, cwd=None if all_cwd else Path.cwd(), include_empty=True
+    )
 
 
 def _prune_candidates(
@@ -588,7 +987,9 @@ def _prune_candidates(
     if before is not None:
         cutoff = _parse_session_datetime(before, end_of_day=False)
         return [row for row in rows if _session_updated_at(row) < cutoff]
-    start_dt = _parse_session_datetime(start, end_of_day=False) if start is not None else None
+    start_dt = (
+        _parse_session_datetime(start, end_of_day=False) if start is not None else None
+    )
     end_dt = _parse_session_datetime(end, end_of_day=True) if end is not None else None
     return [
         row
@@ -675,13 +1076,21 @@ def _print_messages(messages) -> None:
         console.print(Panel(body or "[dim]<empty>[/dim]", title=title))
 
 
-def _print_session_tree(store: SessionStore, session_id: str) -> None:
+def _print_session_tree(store: SessionStoreProtocol, session_id: str) -> None:
     info = store.info(session_id)
     entries = store.entries(session_id)
-    active_path_ids = {entry.id for entry in store.path_entries(session_id)} if info.leaf_id else set()
+    active_path_ids = (
+        {entry.id for entry in store.path_entries(session_id)}
+        if info.leaf_id
+        else set()
+    )
     table = Table("Entry", "Parent", "Type", "Active", "Preview")
     for entry in entries:
-        active = "yes" if entry.id == info.leaf_id else ("path" if entry.id in active_path_ids else "")
+        active = (
+            "yes"
+            if entry.id == info.leaf_id
+            else ("path" if entry.id in active_path_ids else "")
+        )
         table.add_row(
             entry.id,
             entry.parent_id or "",
@@ -692,7 +1101,7 @@ def _print_session_tree(store: SessionStore, session_id: str) -> None:
     console.print(table)
 
 
-def _print_raw_session(store: SessionStore, session_id: str) -> None:
+def _print_raw_session(store: SessionStoreProtocol, session_id: str) -> None:
     path = store.path_for(session_id)
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -708,7 +1117,9 @@ def _print_raw_session(store: SessionStore, session_id: str) -> None:
 def _entry_preview(entry: dict) -> str:
     if entry.get("type") == "message" and isinstance(entry.get("message"), dict):
         message = entry["message"]
-        return f"{message.get('role', '')}: {str(message.get('content', '')).strip()[:80]}"
+        return (
+            f"{message.get('role', '')}: {str(message.get('content', '')).strip()[:80]}"
+        )
     if entry.get("type") == "model_change":
         return f"{entry.get('provider', '')}/{entry.get('model', '')}"
     if entry.get("type") == "compaction":
@@ -724,7 +1135,6 @@ def config_show() -> None:
     console.print(load_config())
     console.print(f"settings: {SETTINGS_PATH}")
     console.print(f"secrets: {SECRETS_PATH}")
-    console.print(f"debug trace: {trace_path()}")
 
 
 @config_app.command("path")
@@ -754,15 +1164,15 @@ def config_set(key: str, value: str) -> None:
         config.base_url = model.base_url
         if model.temperature is not None:
             config.temperature = model.temperature
-    elif key in {"debug.trace", "debug_trace"}:
-        config.debug_trace = _parse_bool(value)
     elif key in {"memory.enabled", "memory_enabled"}:
         config.memory_enabled = _parse_bool(value)
     elif key in {"logging.retention_days", "logging_retention_days"}:
         try:
             retention_days = int(value)
         except ValueError as exc:
-            raise typer.BadParameter("logging.retention_days must be an integer >= 1") from exc
+            raise typer.BadParameter(
+                "logging.retention_days must be an integer >= 1"
+            ) from exc
         if retention_days < 1:
             raise typer.BadParameter("logging.retention_days must be an integer >= 1")
         config.logging_retention_days = retention_days
@@ -780,39 +1190,59 @@ def config_set(key: str, value: str) -> None:
         try:
             config.tools["max_concurrency"] = min(max(int(value), 1), 16)
         except ValueError as exc:
-            raise typer.BadParameter("tools.max_concurrency must be an integer from 1 to 16") from exc
+            raise typer.BadParameter(
+                "tools.max_concurrency must be an integer from 1 to 16"
+            ) from exc
     elif key in {"tools.default_timeout_seconds", "tools_default_timeout_seconds"}:
         try:
-            config.tools["default_timeout_seconds"] = min(max(float(value), 1.0), 3600.0)
+            config.tools["default_timeout_seconds"] = min(
+                max(float(value), 1.0), 3600.0
+            )
         except ValueError as exc:
-            raise typer.BadParameter("tools.default_timeout_seconds must be a number from 1 to 3600") from exc
+            raise typer.BadParameter(
+                "tools.default_timeout_seconds must be a number from 1 to 3600"
+            ) from exc
     elif key in {"modelRouting.retry.enabled", "model_routing.retry.enabled"}:
         config.model_routing["retry"]["enabled"] = _parse_bool(value)
     elif key in {"modelRouting.retry.maxAttempts", "model_routing.retry.max_attempts"}:
         try:
             config.model_routing["retry"]["maxAttempts"] = min(max(int(value), 1), 5)
         except ValueError as exc:
-            raise typer.BadParameter("modelRouting.retry.maxAttempts must be an integer from 1 to 5") from exc
+            raise typer.BadParameter(
+                "modelRouting.retry.maxAttempts must be an integer from 1 to 5"
+            ) from exc
     elif key in {"modelRouting.fallback.enabled", "model_routing.fallback.enabled"}:
         config.model_routing["fallback"]["enabled"] = _parse_bool(value)
     elif key in {"modelRouting.fallback.profiles", "model_routing.fallback.profiles"}:
         profiles = [item.strip() for item in value.split(",") if item.strip()]
         if len(profiles) > 3:
-            raise typer.BadParameter("modelRouting.fallback.profiles accepts at most 3 comma-separated profiles")
+            raise typer.BadParameter(
+                "modelRouting.fallback.profiles accepts at most 3 comma-separated profiles"
+            )
         if len(set(profiles)) != len(profiles):
-            raise typer.BadParameter("modelRouting.fallback.profiles cannot contain duplicates")
+            raise typer.BadParameter(
+                "modelRouting.fallback.profiles cannot contain duplicates"
+            )
         registry = ModelRegistry()
-        unknown = [profile for profile in profiles if registry.find(None, profile) is None]
+        unknown = [
+            profile for profile in profiles if registry.find(None, profile) is None
+        ]
         if unknown:
-            raise typer.BadParameter(f"Unknown fallback model profiles: {', '.join(unknown)}")
+            raise typer.BadParameter(
+                f"Unknown fallback model profiles: {', '.join(unknown)}"
+            )
         primary = registry.find(config.provider, config.model)
-        repeated_primary = [profile for profile in profiles if registry.find(None, profile) == primary]
+        repeated_primary = [
+            profile for profile in profiles if registry.find(None, profile) == primary
+        ]
         if repeated_primary:
-            raise typer.BadParameter("The primary model cannot also be a fallback profile")
+            raise typer.BadParameter(
+                "The primary model cannot also be a fallback profile"
+            )
         config.model_routing["fallback"]["profiles"] = profiles
     else:
         raise typer.BadParameter(
-            "Supported keys: default-model, api-key, debug.trace, memory.enabled, logging.retention_days, "
+            "Supported keys: default-model, api-key, memory.enabled, logging.retention_days, "
             "storage.*, tools.*, modelRouting.retry.*, modelRouting.fallback.*"
         )
     save_config(config)
@@ -823,9 +1253,6 @@ def config_set(key: str, value: str) -> None:
 def config_get(key: str) -> None:
     """Get a configuration value."""
     config = load_config()
-    if key in {"debug.trace", "debug_trace"}:
-        console.print(config.debug_trace)
-        return
     if key in {"memory.enabled", "memory_enabled"}:
         console.print(config.memory_enabled)
         return
@@ -872,10 +1299,14 @@ async def _print_sandbox_status() -> None:
     mode = str(settings.get("mode") or "workspace")
     table = Table("Field", "Value")
     table.add_row("Mode", mode)
-    table.add_row("Environment", getattr(environment, "name", type(environment).__name__))
+    table.add_row(
+        "Environment", getattr(environment, "name", type(environment).__name__)
+    )
     table.add_row("Workspace", str(workspace.root))
     table.add_row("Restrict workspace", str(workspace.restrict))
-    if hasattr(environment, "status"):
+    from spice.sandbox.docker import DockerEnvironment
+
+    if isinstance(environment, DockerEnvironment):
         try:
             status = await environment.status()
         except Exception as exc:
@@ -917,7 +1348,9 @@ async def _sandbox_stop() -> None:
     environment = create_environment(load_config().sandbox, cwd=Path.cwd())
     stop = getattr(environment, "stop", None)
     if stop is None:
-        console.print(f"[yellow]Sandbox environment does not support stop:[/yellow] {getattr(environment, 'name', type(environment).__name__)}")
+        console.print(
+            f"[yellow]Sandbox environment does not support stop:[/yellow] {getattr(environment, 'name', type(environment).__name__)}"
+        )
         return
     try:
         await stop()
@@ -933,7 +1366,9 @@ def _parse_bool(value: str) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise typer.BadParameter("Boolean value must be one of: true/false, yes/no, on/off, 1/0")
+    raise typer.BadParameter(
+        "Boolean value must be one of: true/false, yes/no, on/off, 1/0"
+    )
 
 
 if __name__ == "__main__":

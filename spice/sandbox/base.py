@@ -32,6 +32,7 @@ class ExecutionEnvironment(Protocol):
         env: dict[str, str] | None = None,
     ) -> ExecResult:
         """Run *command* inside the environment."""
+        ...
 
     async def cleanup(self) -> None:
         """Release environment resources."""

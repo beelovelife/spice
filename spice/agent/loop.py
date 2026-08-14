@@ -7,20 +7,14 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import uuid4
 
-from spice.agent.debug_trace import (
-    trace_round_end,
-    trace_round_start,
-    trace_model_fallback,
-    trace_model_retry,
-    trace_turn_end,
-    trace_turn_start,
-)
 from spice.agent.events import (
     AgentErrorEvent,
     AgentEvent,
     AssistantMessageEvent,
     ModelFallbackEvent,
     ModelRetryEvent,
+    ReasoningDeltaEvent,
+    RoundCompleteEvent,
     TextDeltaEvent,
     TurnEndEvent,
     TurnStartEvent,
@@ -38,19 +32,22 @@ from spice.llm.types import (
     ModelFallbackNotice,
     ModelRequestOptions,
     ModelRetryNotice,
+    ReasoningDelta,
     StreamError,
     TextDelta,
     ToolCallEvent,
 )
+from spice.llm.usage import TokenUsage, make_usage_record
 from spice.tools.base import ConfirmFn, Tool
 from spice.tools.file_state import FileStateStore
-from spice.tools.tool_registry import ToolCallError, ToolRegistry
+from spice.tools.tool_registry import ToolRegistry
 from spice.sandbox.base import ExecutionEnvironment
 from spice.sandbox.factory import create_environment, create_workspace_policy
 from spice.sandbox.policy import WorkspacePolicy
 
 MAX_TOOL_ROUNDS = 30
 logger = get_logger(__name__)
+
 
 async def run_turn(
     *,
@@ -82,12 +79,20 @@ async def run_turn(
     )
     workspace = workspace or create_workspace_policy(None, cwd=cwd)
     environment = environment or create_environment(None, cwd=cwd)
-    trace_turn_start(session_label=session_label, prompt=prompt, message_count=len(messages), tool_count=len(tools))
+    logger.debug(
+        "turn_context session=%s messages=%d tools=%d prompt_chars=%d",
+        session_label or "<unknown>",
+        len(messages),
+        len(tools),
+        len(prompt),
+    )
     yield TurnStartEvent(prompt=prompt)
     messages.append(Message(role="user", content=prompt))
     model_messages = list(messages)
     if runtime_context and runtime_context.strip():
-        model_messages.insert(-1, Message(role="system", content=runtime_context.strip()))
+        model_messages.insert(
+            -1, Message(role="system", content=runtime_context.strip())
+        )
     tool_registry = ToolRegistry(tools)
     schemas = tool_registry.schemas()
     route = model_route or ModelRoute(
@@ -97,28 +102,52 @@ async def run_turn(
         stream_factory=stream_model,
     )
     tools_settings = tools_settings or {}
-    max_tool_concurrency = min(max(int(tools_settings.get("max_concurrency", 4)), 1), 16)
-    default_tool_timeout = max(float(tools_settings.get("default_timeout_seconds", 120)), 1.0)
+    max_tool_concurrency = min(
+        max(int(tools_settings.get("max_concurrency", 4)), 1), 16
+    )
+    default_tool_timeout = max(
+        float(tools_settings.get("default_timeout_seconds", 120)), 1.0
+    )
     total_text_chars = 0
     total_tool_calls = 0
-    rounds_run = 0
 
     for _round in range(max_tool_rounds):
         round_index = _round + 1
-        rounds_run = round_index
         round_started = time.perf_counter()
-        logger.info("model_stream_start round=%d message_count=%d", round_index, len(model_messages))
-        trace_round_start(round_index, message_count=len(model_messages))
+        logger.info(
+            "model_stream_start round=%d message_count=%d",
+            round_index,
+            len(model_messages),
+        )
+        logger.debug(
+            "model_round_start round=%d messages=%d schemas=%d",
+            round_index,
+            len(model_messages),
+            len(schemas),
+        )
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         finish_reason: str | None = None
+        token_usage: TokenUsage | None = None
+        done_received = False
 
         async for event in route.stream(model_messages, schemas):
             if isinstance(event, TextDelta):
                 text_parts.append(event.text)
                 yield TextDeltaEvent(event.text)
+            elif isinstance(event, ReasoningDelta):
+                if event.kind == "reasoning":
+                    reasoning_parts.append(event.text)
+                yield ReasoningDeltaEvent(event.text, kind=event.kind)
             elif isinstance(event, ToolCallEvent):
-                tool_calls.append(ToolCall(id=event.id or uuid4().hex[:8], name=event.name, arguments=event.arguments))
+                tool_calls.append(
+                    ToolCall(
+                        id=event.id or uuid4().hex[:8],
+                        name=event.name,
+                        arguments=event.arguments,
+                    )
+                )
             elif isinstance(event, ModelRetryNotice):
                 yield ModelRetryEvent(
                     provider=event.provider,
@@ -128,13 +157,6 @@ async def run_turn(
                     max_attempts=event.max_attempts,
                     delay_seconds=event.delay_seconds,
                     error=event.error,
-                )
-                trace_model_retry(
-                    provider=event.provider,
-                    model=event.model,
-                    attempt=event.next_attempt,
-                    max_attempts=event.max_attempts,
-                    delay_seconds=event.delay_seconds,
                 )
             elif isinstance(event, ModelFallbackNotice):
                 yield ModelFallbackEvent(
@@ -148,13 +170,10 @@ async def run_turn(
                     fallback_index=event.fallback_index,
                     fallback_count=event.fallback_count,
                 )
-                trace_model_fallback(
-                    from_model=f"{event.from_provider}/{event.from_model}",
-                    to_model=f"{event.to_provider}/{event.to_model}",
-                    reason=event.reason,
-                )
             elif isinstance(event, StreamError):
-                logger.error("model_stream_error round=%d error=%s", round_index, event.error)
+                logger.error(
+                    "model_stream_error round=%d error=%s", round_index, event.error
+                )
                 assistant_text = "".join(text_parts)
                 if assistant_text:
                     failed_model = route.actual.model
@@ -167,12 +186,13 @@ async def run_turn(
                     messages.append(assistant_message)
                     model_messages.append(assistant_message)
                     yield AssistantMessageEvent(text=assistant_text, tool_calls=[])
-                trace_turn_end(rounds=round_index, text_chars=total_text_chars + len(assistant_text), tool_calls=total_tool_calls)
                 yield AgentErrorEvent(event.error)
                 yield TurnEndEvent(text=assistant_text, stop_reason="error")
                 return
             elif isinstance(event, Done):
                 finish_reason = event.finish_reason
+                token_usage = event.usage
+                done_received = True
                 break
 
         assistant_text = "".join(text_parts)
@@ -186,28 +206,52 @@ async def run_turn(
             len(assistant_text),
             len(tool_calls),
         )
-        trace_round_end(
+        logger.debug(
+            "model_round_result round=%d finish_reason=%s output_chars=%d tool_names=%s",
             round_index,
-            duration_ms=duration_ms,
-            assistant_text=assistant_text,
-            tool_calls=tool_calls,
-            finish_reason=finish_reason,
+            finish_reason or "<unknown>",
+            len(assistant_text),
+            ",".join(call.name for call in tool_calls) or "<none>",
         )
         actual_model = route.actual.model
+        usage_record = (
+            make_usage_record(actual_model, token_usage, duration_ms=duration_ms)
+            if done_received
+            else None
+        )
         assistant_message = Message(
             role="assistant",
             content=assistant_text,
             tool_calls=tool_calls,
             provider=actual_model.provider,
             model=actual_model.id,
+            metadata={"usage": usage_record.to_dict()}
+            if usage_record is not None
+            else {},
         )
         messages.append(assistant_message)
-        model_messages.append(assistant_message)
-        yield AssistantMessageEvent(text=assistant_text, tool_calls=tool_calls)
+        model_assistant_message = assistant_message
+        if reasoning_parts and tool_calls:
+            model_assistant_message = Message(
+                role="assistant",
+                content=assistant_text,
+                tool_calls=tool_calls,
+                provider=actual_model.provider,
+                model=actual_model.id,
+                metadata={
+                    **assistant_message.metadata,
+                    "_reasoning_content": "".join(reasoning_parts),
+                },
+            )
+        model_messages.append(model_assistant_message)
+        yield AssistantMessageEvent(
+            text=assistant_text, tool_calls=tool_calls, usage=usage_record
+        )
 
         if not tool_calls:
-            logger.info("turn_end text_chars=%d rounds=%d", len(assistant_text), round_index)
-            trace_turn_end(rounds=round_index, text_chars=total_text_chars, tool_calls=total_tool_calls)
+            logger.info(
+                "turn_end text_chars=%d rounds=%d", len(assistant_text), round_index
+            )
             yield TurnEndEvent(text=assistant_text, stop_reason=finish_reason or "stop")
             return
 
@@ -230,6 +274,7 @@ async def run_turn(
             state=execution_state,
         ):
             yield tool_event
+        yield RoundCompleteEvent(round_index=round_index)
         if execution_state.fatal_result is not None:
             message = execution_state.fatal_result.content
             logger.error(
@@ -237,12 +282,10 @@ async def run_turn(
                 execution_state.fatal_tool_name,
                 execution_state.fatal_result.error_code,
             )
-            trace_turn_end(rounds=round_index, text_chars=total_text_chars, tool_calls=total_tool_calls)
             yield AgentErrorEvent(message, kind="fatal_tool")
             yield TurnEndEvent(text=assistant_text, stop_reason="fatal_tool_error")
             return
 
     logger.error("turn_stopped max_tool_rounds=%d", max_tool_rounds)
-    trace_turn_end(rounds=rounds_run, text_chars=total_text_chars, tool_calls=total_tool_calls)
     yield TurnEndEvent(text="", stop_reason="max_tool_rounds")
     yield AgentErrorEvent(f"Stopped after {max_tool_rounds} tool rounds.")

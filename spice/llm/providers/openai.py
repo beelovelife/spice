@@ -11,9 +11,21 @@ from spice.agent.logging_config import get_logger
 from spice.llm.error_safety import stream_error_from_exception
 from spice.llm.messages import Message
 from spice.llm.models import Model
-from spice.llm.types import Done, StreamError, StreamEvent, ModelRequestOptions, TextDelta, ToolCallEvent, ToolSchema
+from spice.llm.providers.client_cache import get_cached_client
+from spice.llm.types import (
+    Done,
+    ModelRequestOptions,
+    ReasoningDelta,
+    StreamError,
+    StreamEvent,
+    TextDelta,
+    ToolCallEvent,
+    ToolSchema,
+)
+from spice.llm.usage import TokenUsage, normalize_openai_usage
 
 logger = get_logger(__name__)
+
 
 class OpenAIProvider:
     def __init__(
@@ -47,10 +59,19 @@ class OpenAIProvider:
         try:
             from openai import AsyncOpenAI
         except ImportError:
-            yield StreamError("Package `openai` is not installed. Run `uv add openai`.", kind="unsupported")
+            yield StreamError(
+                "Package `openai` is not installed. Run `uv add openai`.",
+                kind="unsupported",
+            )
             return
 
-        client = AsyncOpenAI(api_key=options.api_key, base_url=options.base_url or self.default_base_url, max_retries=0)
+        base_url = options.base_url or self.default_base_url
+        client = get_cached_client(
+            ("openai", options.api_key, base_url),
+            lambda: AsyncOpenAI(
+                api_key=options.api_key, base_url=base_url, max_retries=0
+            ),
+        )
         started = time.perf_counter()
         try:
             logger.info(
@@ -59,13 +80,17 @@ class OpenAIProvider:
                 model.id,
                 len(messages),
                 len(tools),
-                bool(options.base_url or self.default_base_url),
+                bool(base_url),
             )
             if self.use_responses:
-                async for event in self._astream_responses(client, model, messages, tools, options, started):
+                async for event in self._astream_responses(
+                    client, model, messages, tools, options, started
+                ):
                     yield event
             else:
-                async for event in self._astream_chat_completions(client, model, messages, tools, options, started):
+                async for event in self._astream_chat_completions(
+                    client, model, messages, tools, options, started
+                ):
                     yield event
         except Exception as exc:
             logger.exception(
@@ -92,28 +117,41 @@ class OpenAIProvider:
     ) -> AsyncIterator[StreamEvent]:
         create_response = cast(Any, client.responses.create)
         response_input, instructions = _messages_to_responses(messages)
-        stream = await create_response(
-            model=model.id,
-            input=response_input,
-            instructions=instructions,
-            tools=[_tool_to_response(tool) for tool in tools] or None,
-            temperature=options.temperature,
-            max_output_tokens=options.max_tokens,
-            stream=True,
-        )
+        request: dict[str, Any] = {
+            "model": model.id,
+            "input": response_input,
+            "instructions": instructions,
+            "tools": [_tool_to_response(tool) for tool in tools] or None,
+            "temperature": options.temperature,
+            "max_output_tokens": options.max_tokens,
+            "stream": True,
+        }
+        if model.supports_reasoning:
+            request["reasoning"] = {"summary": "auto"}
+        stream = await create_response(**request)
         async for event in stream:
             event_type = _get_event_type(event)
             if event_type == "response.output_text.delta":
                 delta = getattr(event, "delta", None)
                 if delta:
                     yield TextDelta(str(delta))
+            elif event_type == "response.reasoning_summary_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield ReasoningDelta(str(delta), kind="summary")
+            elif event_type == "response.reasoning_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield ReasoningDelta(str(delta))
             elif event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 if _get_item_type(item) == "function_call":
                     yield ToolCallEvent(
                         id=str(getattr(item, "call_id", "") or getattr(item, "id", "")),
                         name=str(getattr(item, "name", "")),
-                        arguments=_parse_json_object(str(getattr(item, "arguments", "") or "")),
+                        arguments=_parse_json_object(
+                            str(getattr(item, "arguments", "") or "")
+                        ),
                     )
             elif event_type == "response.completed":
                 response = getattr(event, "response", None)
@@ -126,7 +164,27 @@ class OpenAIProvider:
                     int((time.perf_counter() - started) * 1000),
                     tool_count,
                 )
-                yield Done("completed")
+                yield Done(
+                    "completed",
+                    usage=normalize_openai_usage(getattr(response, "usage", None)),
+                )
+            elif event_type == "response.incomplete":
+                response = getattr(event, "response", None)
+                yield Done(
+                    "incomplete",
+                    usage=normalize_openai_usage(getattr(response, "usage", None)),
+                )
+            elif event_type == "response.failed":
+                response = getattr(event, "response", None)
+                error = getattr(response, "error", None)
+                message = getattr(error, "message", None) or str(
+                    error or "unknown error"
+                )
+                yield StreamError(
+                    f"Provider response failed: {message}",
+                    provider=model.provider,
+                    model=model.id,
+                )
 
     async def _astream_chat_completions(
         self,
@@ -138,6 +196,8 @@ class OpenAIProvider:
         started: float,
     ) -> AsyncIterator[StreamEvent]:
         tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage: TokenUsage | None = None
         create_completion = cast(Any, client.chat.completions.create)
         stream = await create_completion(
             model=model.id,
@@ -146,17 +206,25 @@ class OpenAIProvider:
             temperature=options.temperature,
             max_tokens=options.max_tokens,
             stream=True,
+            stream_options={"include_usage": True},
         )
         async for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage = normalize_openai_usage(chunk.usage)
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
             delta = choice.delta
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            if reasoning_content:
+                yield ReasoningDelta(str(reasoning_content))
             if delta.content:
                 yield TextDelta(delta.content)
             for tc in delta.tool_calls or []:
                 index = tc.index
-                current = tool_calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                current = tool_calls.setdefault(
+                    index, {"id": "", "name": "", "arguments": ""}
+                )
                 if tc.id:
                     current["id"] = tc.id
                 if tc.function:
@@ -165,46 +233,64 @@ class OpenAIProvider:
                     if tc.function.arguments:
                         current["arguments"] += tc.function.arguments
             if choice.finish_reason:
-                for current in tool_calls.values():
-                    yield ToolCallEvent(
-                        id=current["id"],
-                        name=current["name"],
-                        arguments=_parse_json_object(current["arguments"]),
-                    )
-                logger.info(
-                    "provider_request_end provider=%s model=%s finish_reason=%s duration_ms=%d tool_calls=%d",
-                    self.provider_name,
-                    model.id,
-                    choice.finish_reason,
-                    int((time.perf_counter() - started) * 1000),
-                    len(tool_calls),
-                )
-                yield Done(choice.finish_reason)
+                finish_reason = choice.finish_reason
+        for current in tool_calls.values():
+            yield ToolCallEvent(
+                id=current["id"],
+                name=current["name"],
+                arguments=_parse_json_object(current["arguments"]),
+            )
+        logger.info(
+            "provider_request_end provider=%s model=%s finish_reason=%s duration_ms=%d tool_calls=%d",
+            self.provider_name,
+            model.id,
+            finish_reason,
+            int((time.perf_counter() - started) * 1000),
+            len(tool_calls),
+        )
+        yield Done(finish_reason, usage=usage)
 
 
 def _messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for message in messages:
         if message.role == "assistant":
-            item: dict[str, Any] = {"role": "assistant", "content": message.content or None}
+            item: dict[str, Any] = {
+                "role": "assistant",
+                "content": message.content or None,
+            }
+            reasoning_content = message.metadata.get("_reasoning_content")
+            if reasoning_content:
+                item["reasoning_content"] = str(reasoning_content)
             if message.tool_calls:
                 item["tool_calls"] = [
                     {
                         "id": tc.id,
                         "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                        },
                     }
                     for tc in message.tool_calls
                 ]
             output.append(item)
         elif message.role == "tool":
-            output.append({"role": "tool", "tool_call_id": message.tool_call_id, "content": message.content})
+            output.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id,
+                    "content": message.content,
+                }
+            )
         else:
             output.append({"role": message.role, "content": message.content})
     return output
 
 
-def _messages_to_responses(messages: list[Message]) -> tuple[list[dict[str, Any]], str | None]:
+def _messages_to_responses(
+    messages: list[Message],
+) -> tuple[list[dict[str, Any]], str | None]:
     input_items: list[dict[str, Any]] = []
     instructions: list[str] = []
     for message in messages:
@@ -212,6 +298,19 @@ def _messages_to_responses(messages: list[Message]) -> tuple[list[dict[str, Any]
             if message.content:
                 instructions.append(message.content)
         elif message.role == "assistant":
+            reasoning_content = message.metadata.get("_reasoning_content")
+            if reasoning_content:
+                input_items.append(
+                    {
+                        "type": "reasoning",
+                        "content": [
+                            {
+                                "type": "reasoning_text",
+                                "text": str(reasoning_content),
+                            }
+                        ],
+                    }
+                )
             if message.content:
                 input_items.append({"role": "assistant", "content": message.content})
             for tc in message.tool_calls:

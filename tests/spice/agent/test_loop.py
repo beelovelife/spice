@@ -4,11 +4,24 @@ import unittest
 from pathlib import Path
 
 import spice.agent.loop as loop_module
-from spice.agent.events import AgentErrorEvent, AssistantMessageEvent, ToolExecutionEndEvent, TurnEndEvent
+from spice.agent.events import (
+    AgentErrorEvent,
+    AssistantMessageEvent,
+    ReasoningDeltaEvent,
+    ToolExecutionEndEvent,
+    TurnEndEvent,
+)
 from spice.agent.loop import run_turn
 from spice.llm.messages import Message
 from spice.llm.models import Model, ModelPricing
-from spice.llm.types import Done, ModelRequestOptions, StreamError, TextDelta, ToolCallEvent
+from spice.llm.types import (
+    Done,
+    ModelRequestOptions,
+    ReasoningDelta,
+    StreamError,
+    TextDelta,
+    ToolCallEvent,
+)
 from spice.llm.usage import TokenUsage
 from spice.tools.base import Tool, ToolContext, tool_result
 
@@ -27,7 +40,15 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_records_model_usage_on_assistant_message(self) -> None:
         async def fake_stream_model(model, messages, tools, options):
             yield TextDelta("done")
-            yield Done("stop", TokenUsage(input_tokens=100, output_tokens=20, cache_read_tokens=60, cache_metrics_available=True))
+            yield Done(
+                "stop",
+                TokenUsage(
+                    input_tokens=100,
+                    output_tokens=20,
+                    cache_read_tokens=60,
+                    cache_metrics_available=True,
+                ),
+            )
 
         loop_module.stream_model = fake_stream_model
         messages = [Message(role="system", content="")]
@@ -50,16 +71,81 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
 
-        assistant = next(event for event in events if isinstance(event, AssistantMessageEvent))
+        assistant = next(
+            event for event in events if isinstance(event, AssistantMessageEvent)
+        )
         persisted = messages[-1].metadata["usage"]
         self.assertEqual(assistant.usage.tokens.input_tokens, 100)
         self.assertEqual(persisted["model_calls"], 1)
         self.assertEqual(persisted["cache_read_tokens"], 60)
         self.assertEqual(persisted["estimated_cost_usd"], "0.000086")
 
+    async def test_reasoning_is_displayed_and_only_kept_for_live_tool_roundtrip(
+        self,
+    ) -> None:
+        calls = 0
+        seen_second_round: list[Message] = []
+
+        async def fake_stream_model(model, messages, tools, options):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield ReasoningDelta("check inputs")
+                yield ToolCallEvent(id="tc1", name="demo", arguments={"value": "x"})
+                yield Done("tool_calls")
+            else:
+                seen_second_round.extend(messages)
+                yield TextDelta("done")
+                yield Done("stop")
+
+        loop_module.stream_model = fake_stream_model
+        messages = [Message(role="system", content="")]
+        tool = Tool(
+            name="demo",
+            description="demo",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+            execute=_ok_tool,
+        )
+
+        events = [
+            event
+            async for event in run_turn(
+                prompt="hi",
+                messages=messages,
+                model=Model(id="fake", provider="fake"),
+                tools=[tool],
+                options=ModelRequestOptions(),
+                cwd=Path.cwd(),
+                confirm=None,
+            )
+        ]
+
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ReasoningDeltaEvent)],
+            ["check inputs"],
+        )
+        persisted_tool_turn = next(
+            message
+            for message in messages
+            if message.role == "assistant" and message.tool_calls
+        )
+        live_tool_turn = next(
+            message
+            for message in seen_second_round
+            if message.role == "assistant" and message.tool_calls
+        )
+        self.assertNotIn("_reasoning_content", persisted_tool_turn.metadata)
+        self.assertEqual(live_tool_turn.metadata["_reasoning_content"], "check inputs")
+
     async def test_requires_confirmation_defaults_to_deny(self) -> None:
         async def fake_stream_model(model, messages, tools, options):
-            yield ToolCallEvent(id="tc1", name="write_file", arguments={"path": "x.txt", "content": "x"})
+            yield ToolCallEvent(
+                id="tc1", name="write_file", arguments={"path": "x.txt", "content": "x"}
+            )
             yield Done("tool_calls")
 
         loop_module.stream_model = fake_stream_model
@@ -68,7 +154,10 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             description="write",
             parameters={
                 "type": "object",
-                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
                 "required": ["path", "content"],
             },
             execute=_ok_tool,
@@ -86,7 +175,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 confirm=None,
             )
         ]
-        end = next(event for event in events if isinstance(event, ToolExecutionEndEvent))
+        end = next(
+            event for event in events if isinstance(event, ToolExecutionEndEvent)
+        )
         self.assertTrue(end.result.is_error)
         self.assertIn("requires confirmation", end.result.content)
 
@@ -106,7 +197,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         tool = Tool(
             name="demo",
             description="demo",
-            parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
             execute=execute,
         )
         events = [
@@ -121,7 +216,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 confirm=None,
             )
         ]
-        end = next(event for event in events if isinstance(event, ToolExecutionEndEvent))
+        end = next(
+            event for event in events if isinstance(event, ToolExecutionEndEvent)
+        )
         self.assertFalse(executed)
         self.assertTrue(end.result.is_error)
         self.assertIn("missing required argument", end.result.content)
@@ -135,7 +232,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         tool = Tool(
             name="demo",
             description="demo",
-            parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
             execute=_ok_tool,
         )
         events = [
@@ -222,8 +323,12 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertEqual(events[-1].text, "done")
-        self.assertEqual([message.content for message in messages if message.role == "user"], ["hi"])
-        self.assertNotIn("Runtime state", "\n".join(message.content for message in messages))
+        self.assertEqual(
+            [message.content for message in messages if message.role == "user"], ["hi"]
+        )
+        self.assertNotIn(
+            "Runtime state", "\n".join(message.content for message in messages)
+        )
         self.assertEqual(seen_messages[0][-2].role, "system")
         self.assertIn("Runtime state", seen_messages[0][-2].content)
 
@@ -233,7 +338,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             yield Done("tool_calls")
 
         async def execute(args: dict, context: ToolContext):
-            raise RuntimeError("Authorization: Bearer sk-proj-abcdefghijklmnop api_key=super-secret-token")
+            raise RuntimeError(
+                "Authorization: Bearer sk-proj-abcdefghijklmnop api_key=super-secret-token"
+            )
 
         loop_module.stream_model = fake_stream_model
         tool = Tool(
@@ -257,7 +364,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
 
-        end = next(event for event in events if isinstance(event, ToolExecutionEndEvent))
+        end = next(
+            event for event in events if isinstance(event, ToolExecutionEndEvent)
+        )
         self.assertTrue(end.result.is_error)
         self.assertIn("Tool failed", end.result.content)
         self.assertIn("[redacted]", end.result.content)
@@ -285,7 +394,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
 
-        assistant = next(event for event in events if isinstance(event, AssistantMessageEvent))
+        assistant = next(
+            event for event in events if isinstance(event, AssistantMessageEvent)
+        )
         error = next(event for event in events if isinstance(event, AgentErrorEvent))
         end = events[-1]
         self.assertEqual(assistant.text, "partial")

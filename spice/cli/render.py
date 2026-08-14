@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import re
-import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
+from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
@@ -30,12 +29,17 @@ from spice.agent.events import (
     AssistantMessageEvent,
     ModelFallbackEvent,
     ModelRetryEvent,
+    ReasoningDeltaEvent,
+    RoundCompleteEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnEndEvent,
     TurnStartEvent,
 )
+from spice.interactive.activity import activity_text
+from spice.interactive.confirm import ConfirmPolicy, is_file_edit_tool
+from spice.interactive.types import ChoiceRequest, ConfirmChoice, ConfirmRequest
 from spice.tools.base import ToolResult
 
 
@@ -69,56 +73,98 @@ class TodoStatusLine:
     rendered_lines: int = 0
 
 
+class _CliToolConfirmPort:
+    """Render one tool confirmation while ConfirmPolicy owns serialization."""
+
+    def __init__(self, renderer: "CliRenderer", tool_name: str, args: dict) -> None:
+        self.renderer = renderer
+        self.tool_name = tool_name
+        self.args = args
+
+    async def choose(self, request: ChoiceRequest) -> str | None:
+        return None
+
+    async def confirm(self, request: ConfirmRequest) -> str:
+        self.renderer._finish_stream_before_block()
+        if not is_file_edit_tool(self.tool_name):
+            args_preview, folded = _preview_text(
+                str(self.args),
+                max_chars=_ARGS_PREVIEW_CHARS,
+                max_lines=_ARGS_PREVIEW_LINES,
+            )
+            title = f"[yellow]Confirm {self.tool_name}{' (preview)' if folded else ''}[/yellow]"
+            self.renderer.console.print(
+                Panel(args_preview, title=title, border_style="yellow")
+            )
+        return (
+            await _select_confirmation(
+                request.question,
+                choices=request.choices,
+            )
+            or "deny"
+        )
+
+
 class CliRenderer:
     def __init__(self, console: Console, *, markdown: bool = True) -> None:
         self.console = console
         self.markdown = markdown
-        self._allow_file_edits = False
+        self.confirm_policy = ConfirmPolicy()
         self._streaming = False
         self._line_buffer = ""
         self._plain_line_streaming = False
         self._table_buffer: list[str] = []
         self._line_open = False
         self._pending_tool_args: dict[str, dict] = {}
-        self._allow_read_only_bash = False
         self._compact_tool_group: CompactToolGroup | None = None
         self._todo_status = TodoStatusLine()
         self._waiting_started: float | None = None
+        self._waiting_label = "Waiting for model"
         self._waiting_rendered_lines = 0
+        self._reasoning_streaming = False
         self._stream_text_seen = False
 
+    @property
+    def _allow_file_edits(self) -> bool:
+        return self.confirm_policy.allow_file_edits
+
+    @_allow_file_edits.setter
+    def _allow_file_edits(self, value: bool) -> None:
+        self.confirm_policy.allow_file_edits = value
+
+    @property
+    def _allow_all_tools(self) -> bool:
+        return self.confirm_policy.allow_all_tools
+
+    @_allow_all_tools.setter
+    def _allow_all_tools(self, value: bool) -> None:
+        self.confirm_policy.allow_all_tools = value
+
+    @property
+    def _allow_read_only_bash(self) -> bool:
+        return self.confirm_policy.allow_read_only_bash
+
+    @_allow_read_only_bash.setter
+    def _allow_read_only_bash(self, value: bool) -> None:
+        self.confirm_policy.allow_read_only_bash = value
+
     def allow_file_edits_for_session(self) -> None:
-        self._allow_file_edits = True
+        self.confirm_policy.allow_file_edits = True
+
+    def reset_confirm_policy(self) -> None:
+        self.confirm_policy = ConfirmPolicy()
 
     async def confirm(self, tool_name: str, args: dict) -> bool:
-        if _is_file_edit_tool(tool_name) and self._allow_file_edits:
-            return True
-        if tool_name == "bash" and self._allow_read_only_bash and _is_read_only_bash_command(args):
-            return True
-
-        self._finish_stream_before_block()
-        question = _confirmation_question(tool_name, args)
-        if not _is_file_edit_tool(tool_name):
-            args_preview, folded = _preview_text(str(args), max_chars=_ARGS_PREVIEW_CHARS, max_lines=_ARGS_PREVIEW_LINES)
-            title = f"[yellow]Confirm {tool_name}{' (preview)' if folded else ''}[/yellow]"
-            self.console.print(Panel(args_preview, title=title, border_style="yellow"))
-
-        selected = await _select_confirmation(
-            question,
-            allow_all_edits=_is_file_edit_tool(tool_name),
-            allow_read_only_bash=tool_name == "bash" and _is_read_only_bash_command(args),
+        return await self.confirm_policy.confirm(
+            tool_name,
+            args,
+            _CliToolConfirmPort(self, tool_name, args),
         )
-        if selected == "allow_all_edits":
-            self._allow_file_edits = True
-            return True
-        if selected == "allow_read_only_bash":
-            self._allow_read_only_bash = True
-            return True
-        return selected == "allow"
 
     def finish_response(self) -> None:
         """Leave the terminal ready for the next prompt."""
         self._stop_waiting_indicator(clear=True)
+        self._finish_reasoning_stream()
         self._flush_compact_tool_group()
         if self._streaming:
             self._finish_stream()
@@ -136,9 +182,21 @@ class CliRenderer:
             self._flush_compact_tool_group()
             self._todo_status = TodoStatusLine()
             self._reset_markdown_stream()
-            self._start_waiting_indicator()
+            self._start_waiting_indicator("Waiting for model")
+        elif isinstance(event, ReasoningDeltaEvent):
+            self._stop_waiting_indicator(clear=True)
+            self._flush_compact_tool_group()
+            self._freeze_todo_status()
+            if self.console.is_terminal:
+                if not self._reasoning_streaming:
+                    self.console.print("[dim]Thinking:[/dim] ", end="")
+                    self._line_open = True
+                    self._reasoning_streaming = True
+                self.console.print(event.text, style="dim", end="")
+                self._line_open = not event.text.endswith("\n")
         elif isinstance(event, TextDeltaEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             self._flush_compact_tool_group()
             self._freeze_todo_status()
             if not self._streaming:
@@ -151,6 +209,7 @@ class CliRenderer:
                 self._line_open = not event.text.endswith("\n")
         elif isinstance(event, AssistantMessageEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             if event.tool_calls and not (event.text or "").strip():
                 self._streaming = False
                 return
@@ -175,7 +234,7 @@ class CliRenderer:
                 f"Retrying {event.next_attempt}/{event.max_attempts} in {event.delay_seconds:.1f}s "
                 f"({event.provider}/{event.model}).[/yellow]"
             )
-            self._start_waiting_indicator()
+            self._start_waiting_indicator("Retrying model request")
         elif isinstance(event, ModelFallbackEvent):
             self._stop_waiting_indicator(clear=True)
             self._finish_stream_before_block()
@@ -184,30 +243,46 @@ class CliRenderer:
                 f"{event.from_provider}/{event.from_model} -> {event.to_provider}/{event.to_model} "
                 f"[dim](this turn, reason: {event.reason})[/dim]"
             )
-            self._start_waiting_indicator()
+            self._start_waiting_indicator("Waiting for fallback model")
         elif isinstance(event, ToolExecutionStartEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             self._finish_stream_before_block()
             args = event.args or {}
             self._pending_tool_args[event.tool_call_id] = args
             if event.tool_name == "update_todo":
+                self._start_waiting_indicator(
+                    f"Running {event.tool_name}", stream_prefix=False
+                )
                 return
             self._freeze_todo_status()
             start = format_tool_start(event.tool_name, args)
             if event.tool_name in COMPACTABLE_TOOL_NAMES:
                 self._start_compact_tool(event.tool_name, start)
+                self._start_waiting_indicator(
+                    f"Running {event.tool_name}", stream_prefix=False
+                )
                 return
             self._flush_compact_tool_group()
             self.console.print(f"[magenta]{start}[/magenta]")
             self._line_open = False
+            self._start_waiting_indicator(
+                f"Running {event.tool_name}", stream_prefix=False
+            )
         elif isinstance(event, ToolExecutionEndEvent):
             self._stop_waiting_indicator(clear=True)
             self._finish_stream_before_block()
             had_start = event.tool_call_id in self._pending_tool_args
             args = self._pending_tool_args.pop(event.tool_call_id, {})
             summary = format_tool_end(event.tool_name, args, event.result)
-            if had_start and event.tool_name in COMPACTABLE_TOOL_NAMES and self._compact_tool_group is not None:
-                self._finish_compact_tool(event.tool_name, summary, is_error=event.result.is_error)
+            if (
+                had_start
+                and event.tool_name in COMPACTABLE_TOOL_NAMES
+                and self._compact_tool_group is not None
+            ):
+                self._finish_compact_tool(
+                    event.tool_name, summary, is_error=event.result.is_error
+                )
                 return
             self._flush_compact_tool_group()
             style = _tool_result_style(event.result)
@@ -215,21 +290,34 @@ class CliRenderer:
                 self._render_todo_status(event.result)
             else:
                 self._freeze_todo_status()
-                self.console.print(f"{_SUMMARY_INDENT}[{style}]{escape(summary)}[/{style}]")
+                self.console.print(
+                    f"{_SUMMARY_INDENT}[{style}]{escape(summary)}[/{style}]"
+                )
             self._line_open = False
+        elif isinstance(event, RoundCompleteEvent):
+            self._finish_reasoning_stream()
+            self._start_waiting_indicator("Waiting for model")
         elif isinstance(event, AgentErrorEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             self._flush_compact_tool_group()
             if self._streaming:
                 self._finish_stream(blank_line=False)
                 self._streaming = False
             if event.kind == "fatal_tool":
-                self.console.print(f"[bold yellow]Current turn stopped:[/bold yellow] {event.message}")
+                self.console.print(
+                    f"[bold yellow]Current turn stopped:[/bold yellow] {event.message}"
+                )
+            elif event.kind == "user_interrupted":
+                self.console.print(
+                    f"[bold yellow]Interrupted:[/bold yellow] {event.message}"
+                )
             else:
                 self.console.print(f"[bold red]Error:[/bold red] {event.message}")
             self._line_open = False
         elif isinstance(event, TurnEndEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             self._flush_compact_tool_group()
             if self._streaming:
                 self._finish_stream()
@@ -241,12 +329,15 @@ class CliRenderer:
         self._line_open = True
         self._streaming = True
 
-    def _start_waiting_indicator(self) -> None:
+    def _start_waiting_indicator(
+        self, label: str, *, stream_prefix: bool = True
+    ) -> None:
         self._waiting_started = time.monotonic()
+        self._waiting_label = label
         self._stream_text_seen = False
         if self.console.is_terminal:
             self._render_waiting_indicator()
-        else:
+        elif stream_prefix:
             self._begin_response_stream()
 
     def _render_waiting_indicator(self) -> None:
@@ -254,8 +345,11 @@ class CliRenderer:
             return
         if self._waiting_rendered_lines:
             self._clear_rendered_tool_lines(self._waiting_rendered_lines)
-        elapsed = max(0, int(time.monotonic() - self._waiting_started))
-        self.console.print(f"[bold cyan]Spice:[/bold cyan] [italic yellow]thinking... {_format_elapsed(elapsed)}[/italic yellow]")
+        elapsed = max(0.0, time.monotonic() - self._waiting_started)
+        status = activity_text(self._waiting_label, elapsed)
+        self.console.print(
+            f"[bold cyan]Spice:[/bold cyan] [italic yellow]{status}[/italic yellow]"
+        )
         self._waiting_rendered_lines = 1
         self._line_open = False
 
@@ -267,6 +361,12 @@ class CliRenderer:
         self._waiting_started = None
         self._waiting_rendered_lines = 0
 
+    def _finish_reasoning_stream(self) -> None:
+        if not self._reasoning_streaming:
+            return
+        self._ensure_newline()
+        self._reasoning_streaming = False
+
     def _render_todo_status(self, result: ToolResult) -> None:
         line = _todo_status_line(result)
         if not line:
@@ -274,14 +374,19 @@ class CliRenderer:
         if self.console.is_terminal and self._todo_status.rendered_lines:
             self._clear_rendered_tool_lines(self._todo_status.rendered_lines)
         self.console.print(f"[green]{escape(line)}[/green]")
-        self._todo_status = TodoStatusLine(text=line, rendered_lines=1 if self.console.is_terminal else 0)
+        self._todo_status = TodoStatusLine(
+            text=line, rendered_lines=1 if self.console.is_terminal else 0
+        )
         self._line_open = False
 
     def _freeze_todo_status(self) -> None:
         self._todo_status.rendered_lines = 0
 
     def _start_compact_tool(self, tool_name: str, start: str) -> None:
-        if self._compact_tool_group is not None and self._compact_tool_group.tool_name != tool_name:
+        if (
+            self._compact_tool_group is not None
+            and self._compact_tool_group.tool_name != tool_name
+        ):
             self._flush_compact_tool_group()
         if self._compact_tool_group is None:
             self._compact_tool_group = CompactToolGroup(tool_name=tool_name)
@@ -290,8 +395,13 @@ class CliRenderer:
         self._compact_tool_group.last_end = ""
         self._render_live_compact_tool_group()
 
-    def _finish_compact_tool(self, tool_name: str, summary: str, *, is_error: bool) -> None:
-        if self._compact_tool_group is None or self._compact_tool_group.tool_name != tool_name:
+    def _finish_compact_tool(
+        self, tool_name: str, summary: str, *, is_error: bool
+    ) -> None:
+        if (
+            self._compact_tool_group is None
+            or self._compact_tool_group.tool_name != tool_name
+        ):
             self._flush_compact_tool_group()
             self._compact_tool_group = CompactToolGroup(tool_name=tool_name, count=1)
         self._compact_tool_group.last_end = summary
@@ -493,17 +603,12 @@ def _split_table_cells(line: str) -> list[str]:
     return [cell.strip() for cell in stripped.split("|")]
 
 
-def _format_elapsed(seconds: int) -> str:
-    if seconds < 60:
-        return f"{seconds}s"
-    minutes, remaining = divmod(seconds, 60)
-    return f"{minutes}m{remaining:02d}s"
-
-
 def _build_table(lines: list[str]) -> Table:
     header = _split_table_cells(lines[0])
     rows = [_split_table_cells(line) for line in lines[2:]]
-    column_count = max(len(header), *(len(row) for row in rows)) if rows else len(header)
+    column_count = (
+        max(len(header), *(len(row) for row in rows)) if rows else len(header)
+    )
     header += [""] * (column_count - len(header))
 
     table = Table(box=box.ROUNDED, header_style="bold cyan", show_lines=False)
@@ -559,6 +664,8 @@ def _detail_int(result: ToolResult, key: str, default):
     if not isinstance(result.details, dict):
         return default
     value = result.details.get(key)
+    if value is None:
+        return default
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -627,8 +734,14 @@ def _tool_result_style(result: ToolResult) -> str:
 
 def _format_guidance_summary(result: ToolResult) -> str | None:
     if result.details.get("presentation") == "guidance":
-        first_line = next((line for line in (result.content or "").splitlines() if line.strip()), "")
-        return f"! {_humanize_file_state_guard(first_line)}" if first_line else "! Action needed"
+        first_line = next(
+            (line for line in (result.content or "").splitlines() if line.strip()), ""
+        )
+        return (
+            f"! {_humanize_file_state_guard(first_line)}"
+            if first_line
+            else "! Action needed"
+        )
     text = (result.content or "").strip()
     first_line = next((line for line in text.splitlines() if line.strip()), "")
     if first_line.startswith("read_file must be called first before "):
@@ -640,10 +753,14 @@ def _format_guidance_summary(result: ToolResult) -> str | None:
 
 def _humanize_file_state_guard(message: str) -> str:
     if message.startswith("read_file must be called first before overwriting "):
-        path = message.removeprefix("read_file must be called first before overwriting ").rstrip(".")
+        path = message.removeprefix(
+            "read_file must be called first before overwriting "
+        ).rstrip(".")
         return f"Read file first before overwriting {path}"
     if message.startswith("read_file must be called first before editing "):
-        path = message.removeprefix("read_file must be called first before editing ").rstrip(".")
+        path = message.removeprefix(
+            "read_file must be called first before editing "
+        ).rstrip(".")
         return f"Read file first before editing {path}"
     if message.startswith("Full read_file must be called before editing "):
         rest = message.removeprefix("Full read_file must be called before editing ")
@@ -691,7 +808,9 @@ def _write_file_start(args: dict) -> str:
 
 
 def _write_file_end(args: dict, result: ToolResult) -> str:
-    lines = _detail_int(result, "line_count", _line_count(str(args.get("content") or "")))
+    lines = _detail_int(
+        result, "line_count", _line_count(str(args.get("content") or ""))
+    )
     chars = _detail_int(result, "char_count", len(str(args.get("content") or "")))
     if lines or chars:
         return f"✓ Wrote {lines} {_plural(lines, 'line')} · {chars} chars"
@@ -730,7 +849,11 @@ def _apply_patch_end(args: dict, result: ToolResult) -> str:
     files = _detail_int(result, "files_changed", 0)
     if not plus and not minus:
         plus, minus = _diff_counts(result.content or "")
-    prefix = "✓ Previewed patch" if args.get("dry_run") or _detail_bool(result, "dry_run") else "✓ Applied patch"
+    prefix = (
+        "✓ Previewed patch"
+        if args.get("dry_run") or _detail_bool(result, "dry_run")
+        else "✓ Applied patch"
+    )
     file_part = f" · {files} {_plural(files, 'file')}" if files else ""
     if plus or minus:
         return f"{prefix}{file_part} · +{plus} −{minus} lines"
@@ -830,7 +953,9 @@ def _skills_list_start(args: dict) -> str:
 
 
 def _skills_list_end(args: dict, result: ToolResult) -> str:
-    items = sum(1 for line in (result.content or "").splitlines() if line.startswith("- "))
+    items = sum(
+        1 for line in (result.content or "").splitlines() if line.startswith("- ")
+    )
     if items:
         return f"✓ Listed {items} skills"
     return "✓ No skills found"
@@ -876,7 +1001,9 @@ def _update_todo_end(args: dict, result: ToolResult) -> str:
         if not isinstance(item, dict):
             continue
         item_id = str(item.get("id") or "?")
-        content = _truncate_inline(str(item.get("content") or "(no description)"), limit=100)
+        content = _truncate_inline(
+            str(item.get("content") or "(no description)"), limit=100
+        )
         status = str(item.get("status") or "pending")
         lines.append(f"  {_todo_marker(status)} {item_id}. {content} ({status})")
     return "\n".join(lines)
@@ -891,13 +1018,29 @@ def _todo_status_line(result: ToolResult) -> str:
     in_progress = int(summary.get("in_progress") or 0)
     pending = int(summary.get("pending") or 0)
     cancelled = int(summary.get("cancelled") or 0)
-    active = next((item for item in items if str(item.get("status") or "pending") == "in_progress"), None)
+    active = next(
+        (
+            item
+            for item in items
+            if str(item.get("status") or "pending") == "in_progress"
+        ),
+        None,
+    )
     if active is None:
-        active = next((item for item in items if str(item.get("status") or "pending") == "pending"), None)
+        active = next(
+            (
+                item
+                for item in items
+                if str(item.get("status") or "pending") == "pending"
+            ),
+            None,
+        )
     if active is None:
         suffix = "completed" if not cancelled else f"completed · {cancelled} cancelled"
     else:
-        suffix = _truncate_inline(str(active.get("content") or "(no description)"), limit=100)
+        suffix = _truncate_inline(
+            str(active.get("content") or "(no description)"), limit=100
+        )
     parts = [f"● todo {completed}/{total}"]
     if in_progress:
         parts.append(f"{in_progress} running")
@@ -906,7 +1049,9 @@ def _todo_status_line(result: ToolResult) -> str:
     return " · ".join(parts + [suffix])
 
 
-def _todo_display_lines(result: ToolResult, *, include_summary: bool = False) -> list[str]:
+def _todo_display_lines(
+    result: ToolResult, *, include_summary: bool = False
+) -> list[str]:
     payload = _todo_payload(result)
     todos = payload.get("todos") if isinstance(payload, dict) else None
     summary = payload.get("summary") if isinstance(payload, dict) else None
@@ -933,7 +1078,9 @@ def _todo_display_lines(result: ToolResult, *, include_summary: bool = False) ->
         if not isinstance(item, dict):
             continue
         item_id = str(item.get("id") or "?")
-        content = _truncate_inline(str(item.get("content") or "(no description)"), limit=100)
+        content = _truncate_inline(
+            str(item.get("content") or "(no description)"), limit=100
+        )
         status = str(item.get("status") or "pending")
         lines.append(f"{_todo_marker(status)} {item_id}. {content}")
     return lines
@@ -958,7 +1105,9 @@ def _todo_items_from_result(result: ToolResult) -> tuple[list[dict], dict[str, i
 
 
 def _todo_payload(result: ToolResult) -> dict:
-    if isinstance(result.details, dict) and isinstance(result.details.get("todos"), list):
+    if isinstance(result.details, dict) and isinstance(
+        result.details.get("todos"), list
+    ):
         return result.details
     try:
         parsed = json.loads(result.content or "{}")
@@ -968,7 +1117,13 @@ def _todo_payload(result: ToolResult) -> dict:
 
 
 def _todo_summary(todos: list) -> dict[str, int]:
-    counts = {"total": 0, "pending": 0, "in_progress": 0, "completed": 0, "cancelled": 0}
+    counts = {
+        "total": 0,
+        "pending": 0,
+        "in_progress": 0,
+        "completed": 0,
+        "cancelled": 0,
+    }
     for item in todos:
         if not isinstance(item, dict):
             continue
@@ -1005,10 +1160,16 @@ _TOOL_SPECS: dict[str, _ToolSpec] = {
 }
 
 
-def _preview_tool_result(tool_name: str, content: str, *, is_error: bool) -> tuple[str, bool]:
+def _preview_tool_result(
+    tool_name: str, content: str, *, is_error: bool
+) -> tuple[str, bool]:
     if not is_error and tool_name in _PREVIEW_FIRST_TOOLS:
-        return _preview_text(content, max_chars=_COMPACT_PREVIEW_CHARS, max_lines=_COMPACT_PREVIEW_LINES)
-    return _preview_text(content, max_chars=_DEFAULT_PREVIEW_CHARS, max_lines=_DEFAULT_PREVIEW_LINES)
+        return _preview_text(
+            content, max_chars=_COMPACT_PREVIEW_CHARS, max_lines=_COMPACT_PREVIEW_LINES
+        )
+    return _preview_text(
+        content, max_chars=_DEFAULT_PREVIEW_CHARS, max_lines=_DEFAULT_PREVIEW_LINES
+    )
 
 
 def _preview_text(text: str, *, max_chars: int, max_lines: int) -> tuple[str, bool]:
@@ -1033,196 +1194,77 @@ def _preview_text(text: str, *, max_chars: int, max_lines: int) -> tuple[str, bo
     return f"{preview}\n\n... {'; '.join(note_parts)}.", True
 
 
+# Compatibility wrappers — canonical rules live in spice.interactive.confirm.
 def _is_file_edit_tool(tool_name: str) -> bool:
-    return tool_name in {"write_file", "edit_file", "apply_patch"}
+    from spice.interactive.confirm import is_file_edit_tool
+
+    return is_file_edit_tool(tool_name)
 
 
 def _confirmation_question(tool_name: str, args: dict) -> str:
-    path = str(args.get("path") or "").strip()
-    target = path or "the target file"
-    if tool_name == "write_file":
-        return f"Do you want to write {target}?"
-    if tool_name == "edit_file":
-        return f"Do you want to edit {target}?"
-    if tool_name == "bash":
-        if _bash_may_modify_files(args):
-            return "Do you want to run this command? It may modify files; prefer edit_file or apply_patch when possible."
-        return "Do you want to run this command?"
-    return f"Do you want to run {tool_name}?"
+    from spice.interactive.confirm import confirmation_question
 
-
-def _bash_may_modify_files(args: dict) -> bool:
-    command = str(args.get("command") or "").strip().lower()
-    if not command:
-        return False
-    write_markers = (
-        "sed -i",
-        "perl -pi",
-        "python -c",
-        "python3 -c",
-        " write_text(",
-        ".write(",
-        "open(",
-        ">>",
-        ">",
-    )
-    if not any(marker in command for marker in write_markers):
-        return False
-    return any(
-        marker in command
-        for marker in (
-            "open(",
-            ".write(",
-            "write_text(",
-            "sed -i",
-            "perl -pi",
-            ">>",
-            ">",
-            "mode='w'",
-            'mode="w"',
-            "', 'w'",
-            '", "w"',
-            "', 'a'",
-            '", "a"',
-        )
-    )
+    return confirmation_question(tool_name, args)
 
 
 def _is_read_only_bash_command(args: dict) -> bool:
-    command = str(args.get("command") or "").strip()
-    if not command:
-        return False
-    try:
-        parts = _shell_command_tokens(command)
-    except ValueError:
-        return False
-    if not parts:
-        return False
-    if any(part in {";", "&", "||", ">", ">>", "<", "<<", "<<<"} for part in parts):
-        return False
-    for command_parts in _split_shell_commands(parts):
-        if not command_parts:
-            return False
-        program = command_parts[0].rsplit("/", 1)[-1]
-        if program == "cd":
-            if not _cd_stays_in_workspace(command_parts):
-                return False
-            continue
-        if not _bash_paths_stay_in_workspace(command_parts):
-            return False
-        if not _is_read_only_program_call(command_parts):
-            return False
-    return True
+    from spice.interactive.confirm import is_read_only_bash_command
 
-
-def _shell_command_tokens(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
-
-
-def _split_shell_commands(parts: list[str]) -> list[list[str]]:
-    commands: list[list[str]] = []
-    current: list[str] = []
-    for part in parts:
-        if part in {"&&", "|"}:
-            commands.append(current)
-            current = []
-        else:
-            current.append(part)
-    commands.append(current)
-    return commands
-
-
-def _is_read_only_program_call(parts: list[str]) -> bool:
-    program = parts[0].rsplit("/", 1)[-1]
-    if program in {"rg", "grep", "cat", "head", "tail", "ls", "pwd", "wc", "echo", "sort", "uniq"}:
-        return True
-    if program == "awk":
-        script = " ".join(parts[1:]).lower()
-        return "system(" not in script and ">" not in script
-    if program == "sed":
-        return not any(part == "-i" or part.startswith("-i") or part == "--in-place" for part in parts[1:])
-    if program == "find":
-        forbidden = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
-        return not any(part in forbidden for part in parts[1:])
-    if program == "git":
-        if len(parts) < 2:
-            return False
-        return parts[1] in {
-            "branch",
-            "describe",
-            "diff",
-            "grep",
-            "log",
-            "ls-files",
-            "remote",
-            "rev-parse",
-            "show",
-            "status",
-        }
-    return False
-
-
-def _cd_stays_in_workspace(parts: list[str]) -> bool:
-    if len(parts) != 2:
-        return False
-    return _bash_paths_stay_in_workspace(parts)
-
-
-def _bash_paths_stay_in_workspace(parts: list[str]) -> bool:
-    cwd = Path.cwd().resolve()
-    for token in parts[1:]:
-        if not token or token.startswith("-"):
-            continue
-        if token in {".", "./"}:
-            continue
-        if ".." in Path(token).parts:
-            return False
-        path = Path(token).expanduser()
-        if path.is_absolute():
-            try:
-                resolved = path.resolve()
-            except OSError:
-                return False
-            if resolved != cwd and cwd not in resolved.parents:
-                return False
-    return True
+    return is_read_only_bash_command(args)
 
 
 async def _select_confirmation(
     question: str,
     *,
+    choices: tuple[ConfirmChoice, ...] | None = None,
     allow_all_edits: bool = False,
     allow_read_only_bash: bool = False,
 ) -> str | None:
-    choices = [
-        ("allow", "Yes", "allow once"),
-        ("deny", "No", "do not run this tool"),
-    ]
-    if allow_all_edits:
-        choices.insert(1, ("allow_all_edits", "Yes, allow all edits during this session", "shift+tab"))
-    if allow_read_only_bash:
-        choices.insert(1, ("allow_read_only_bash", "Yes, allow read-only shell commands this session", "grep/sed/rg/cat/ls"))
+    if choices is None:
+        legacy_choices = [
+            ("allow", "Yes", "allow once"),
+            ("deny", "No", "do not run this tool"),
+        ]
+        if allow_all_edits:
+            legacy_choices.insert(
+                1,
+                (
+                    "allow_all_edits",
+                    "Yes, allow all edits during this session",
+                    "shift+tab",
+                ),
+            )
+        if allow_read_only_bash:
+            legacy_choices.insert(
+                1,
+                (
+                    "allow_read_only_bash",
+                    "Yes, allow read-only shell commands this session",
+                    "grep/sed/rg/cat/ls",
+                ),
+            )
+    else:
+        legacy_choices = [
+            (choice.id, choice.label, choice.detail) for choice in choices
+        ]
     selected_index = 0
     key_bindings = KeyBindings()
 
     @key_bindings.add("up")
     def _move_up(event) -> None:
         nonlocal selected_index
-        selected_index = (selected_index - 1) % len(choices)
+        selected_index = (selected_index - 1) % len(legacy_choices)
         event.app.invalidate()
 
     @key_bindings.add("down")
     def _move_down(event) -> None:
         nonlocal selected_index
-        selected_index = (selected_index + 1) % len(choices)
+        selected_index = (selected_index + 1) % len(legacy_choices)
         event.app.invalidate()
 
     @key_bindings.add("enter")
     def _confirm(event) -> None:
-        event.app.exit(result=choices[selected_index][0])
+        event.app.exit(result=legacy_choices[selected_index][0])
 
     @key_bindings.add("escape")
     @key_bindings.add("c-c")
@@ -1233,28 +1275,28 @@ async def _select_confirmation(
         def _handle(mouse_event):
             nonlocal selected_index
             if mouse_event.event_type == MouseEventType.SCROLL_UP:
-                selected_index = (selected_index - 1) % len(choices)
+                selected_index = (selected_index - 1) % len(legacy_choices)
                 get_app().invalidate()
             elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-                selected_index = (selected_index + 1) % len(choices)
+                selected_index = (selected_index + 1) % len(legacy_choices)
                 get_app().invalidate()
             elif mouse_event.event_type == MouseEventType.MOUSE_UP:
                 selected_index = index
-                get_app().exit(result=choices[selected_index][0])
+                get_app().exit(result=legacy_choices[selected_index][0])
             return None
 
         return _handle
 
     def _fragments():
-        fragments = [
+        fragments: StyleAndTextTuples = [
             ("", "\n"),
             ("", "  "),
             ("#c7d2fe", question),
             ("", "\n"),
             ("#6b7280", "  Esc to cancel\n\n"),
         ]
-        number_width = len(str(len(choices)))
-        for index, (value, label, detail) in enumerate(choices):
+        number_width = len(str(len(legacy_choices)))
+        for index, (value, label, detail) in enumerate(legacy_choices):
             mouse_handler = _mouse_handler(index)
             selected = index == selected_index
             arrow_style = f"{_SELECT_BG} #f0abfc bold" if selected else "#f0abfc bold"
@@ -1264,9 +1306,11 @@ async def _select_confirmation(
             fragments.append(("", " ", mouse_handler))
             fragments.append((arrow_style, "❯" if selected else " ", mouse_handler))
             fragments.append((muted_style, " ", mouse_handler))
-            fragments.append((muted_style, f"{index + 1:>{number_width}}. ", mouse_handler))
+            fragments.append(
+                (muted_style, f"{index + 1:>{number_width}}. ", mouse_handler)
+            )
             fragments.append((label_style, label, mouse_handler))
-            if value in {"allow_all_edits", "allow_read_only_bash"}:
+            if detail:
                 fragments.append((muted_style, "  ", mouse_handler))
                 fragments.append((detail_style, detail, mouse_handler))
             fragments.append(("", "\n"))

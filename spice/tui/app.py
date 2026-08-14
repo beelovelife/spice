@@ -24,6 +24,7 @@ import time
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -32,7 +33,14 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import ConditionalContainer, Float, FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.layout import (
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    Layout,
+    Window,
+)
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
@@ -53,6 +61,8 @@ from spice.agent.events import (
     AssistantMessageEvent,
     ModelFallbackEvent,
     ModelRetryEvent,
+    ReasoningDeltaEvent,
+    RoundCompleteEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -60,50 +70,54 @@ from spice.agent.events import (
     TurnEndEvent,
     TurnStartEvent,
 )
-from spice.cli.commands import SESSION_PICKER_LIMIT, SlashCommandRegistry, _entry_active_label, _entry_preview, _parse_force_note, _sustained_goal_prompt
-from spice.cli.completion import SpiceInputCompleter, accept_completion, insert_text_and_maybe_complete, start_or_accept_completion
+from spice.cli.commands import SlashCommandRegistry
+from spice.cli.completion import (
+    SpiceInputCompleter,
+    accept_completion,
+    insert_text_and_maybe_complete,
+    start_or_accept_completion,
+)
 from spice.cli.render import (
     COMPACTABLE_TOOL_NAMES,
     CompactToolGroup,
-    _confirmation_question,
-    _is_read_only_bash_command,
-    _is_file_edit_tool,
     _is_table_divider,
     _looks_like_table_line,
-    _format_elapsed,
     _split_table_cells,
     _preview_text,
-    _preview_tool_result,
     _todo_items_from_result,
     _todo_marker,
     format_tool_end,
     format_tool_start,
+)
+from spice.interactive.activity import activity_parts, activity_text
+from spice.interactive.commands import is_execute_request
+from spice.interactive.confirm import (
+    ConfirmPolicy,
+    is_file_edit_tool,
+)
+from spice.interactive.sessions import (
+    SESSION_PICKER_LIMIT,
+    entry_active_label,
+    entry_preview,
+)
+from spice.interactive.types import (
+    ChoiceItem,
+    ChoiceRequest,
+    CommandContext,
+    CommandResult,
+    ConfirmRequest,
+    PanelView,
+    TableView,
+    TextView,
 )
 from spice.cli.terminal import enable_cursor_blink_after_render
 from spice.cli.welcome import WELCOME_QUOTES
 from spice.llm.config import get_api_key, load_config, save_config
 from spice.llm.models import Model
 from spice.llm.model_registry import ModelRegistry
-from spice.skills.loader import load_skills, read_skill_file
+from spice.skills.loader import load_skills, read_skill_content
 from spice.storage.factory import create_session_store
 from spice.tools.tool_registry import READ_ONLY_TOOLS, TOOLSETS, create_all_tools
-
-
-def _is_execute_request(message: str) -> bool:
-    normalized = message.strip().lower()
-    return normalized in {
-        "执行",
-        "执行吧",
-        "开始执行",
-        "开始改",
-        "按这个做",
-        "可以执行",
-        "go",
-        "go ahead",
-        "execute",
-        "run it",
-        "do it",
-    }
 
 
 class _TuiConsole:
@@ -112,9 +126,38 @@ class _TuiConsole:
 
     def print(self, *objects, **kwargs) -> None:
         output = StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None, width=100)
+        console = Console(
+            file=output, force_terminal=False, color_system=None, width=100
+        )
         console.print(*objects, **kwargs)
         self.owner._append(output.getvalue())
+
+
+class _TuiInteractivePort:
+    def __init__(self, owner: "SpiceTUI") -> None:
+        self.owner = owner
+
+    async def choose(self, request: ChoiceRequest) -> str | None:
+        return await self.owner._port_choose(request)
+
+    async def confirm(self, request: ConfirmRequest) -> str:
+        return await self.owner._port_confirm(request)
+
+
+class _TuiToolConfirmPort(_TuiInteractivePort):
+    """Render one tool preview while ConfirmPolicy serializes the modal."""
+
+    def __init__(self, owner: "SpiceTUI", tool_name: str, args: dict) -> None:
+        super().__init__(owner)
+        self.tool_name = tool_name
+        self.args = args
+
+    async def confirm(self, request: ConfirmRequest) -> str:
+        self.owner._ensure_newline()
+        if not is_file_edit_tool(self.tool_name):
+            args_preview, _ = _preview_text(str(self.args), max_chars=700, max_lines=8)
+            self.owner._append(f"\nConfirm {self.tool_name}\n{args_preview}\n")
+        return await self.owner._port_confirm(request)
 
 
 def _compact_blank_lines(text: str, *, max_blank_lines: int = 1) -> str:
@@ -170,7 +213,9 @@ def _render_plain_markdown(text: str) -> str:
             continue
         numbered = re.match(r"^(\d+[.)])\s+(.*)$", stripped)
         if numbered:
-            rendered.append(f" {numbered.group(1)} {_strip_inline_markdown(numbered.group(2))}")
+            rendered.append(
+                f" {numbered.group(1)} {_strip_inline_markdown(numbered.group(2))}"
+            )
             prev_kind = "list"
             continue
         if prev_kind == "list" and rendered and rendered[-1].strip():
@@ -192,7 +237,9 @@ def _strip_inline_markdown(text: str) -> str:
 def _render_plain_table(lines: list[str], *, width: int) -> str:
     header = _split_table_cells(lines[0])
     rows = [_split_table_cells(line) for line in lines[2:]]
-    column_count = max(len(header), *(len(row) for row in rows)) if rows else len(header)
+    column_count = (
+        max(len(header), *(len(row) for row in rows)) if rows else len(header)
+    )
     header += [""] * (column_count - len(header))
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None, width=width)
@@ -269,18 +316,22 @@ class SpiceTUI:
         model: str | None = None,
         session_id: str | None = None,
         continue_session: bool = False,
+        trace: bool = False,
+        trace_file: Path | None = None,
     ) -> None:
         self._provider = provider
         self._model = model
         self._session_id = session_id
         self._continue_session = continue_session
+        self._trace = trace
+        self._trace_file = trace_file
+        self._trace_writer = None
         self._welcome_quote_en, self._welcome_quote_zh = random.choice(WELCOME_QUOTES)
         self._agent_session: AgentSession | None = None
         self._busy = False
         self._streaming = False
         self._pending_task: asyncio.Task | None = None
-        self._allow_file_edits = False
-        self._allow_read_only_bash = False
+        self.confirm_policy = ConfirmPolicy()
         self._show_edit_mode_hint = False
         self._confirmation_future: asyncio.Future[str | None] | None = None
         self._confirmation_question = ""
@@ -301,10 +352,17 @@ class SpiceTUI:
         self._rewind_choice_start = 0
         self._message_follow_tail = True
         self._message_vertical_scroll = 0
+        self._message_display_width: int | None = None
+        self._message_display_height: int | None = None
         self._response_start = 0
         self._response_parts: list[str] = []
         self._waiting_started: float | None = None
         self._waiting_start: int | None = None
+        self._waiting_label = "Waiting for model"
+        self._reasoning_streaming = False
+        self._activity_started: float | None = None
+        self._last_stream_delta_at: float | None = None
+        self._active_tool_name: str | None = None
         self._pending_tool_args: dict[str, dict] = {}
         self._compact_tool_group: CompactToolGroup | None = None
         self._todo_items: list[dict] = []
@@ -319,6 +377,30 @@ class SpiceTUI:
 
         self._app: Application = self._build_app()
 
+    @property
+    def _allow_file_edits(self) -> bool:
+        return self.confirm_policy.allow_file_edits
+
+    @_allow_file_edits.setter
+    def _allow_file_edits(self, value: bool) -> None:
+        self.confirm_policy.allow_file_edits = value
+
+    @property
+    def _allow_all_tools(self) -> bool:
+        return self.confirm_policy.allow_all_tools
+
+    @_allow_all_tools.setter
+    def _allow_all_tools(self, value: bool) -> None:
+        self.confirm_policy.allow_all_tools = value
+
+    @property
+    def _allow_read_only_bash(self) -> bool:
+        return self.confirm_policy.allow_read_only_bash
+
+    @_allow_read_only_bash.setter
+    def _allow_read_only_bash(self, value: bool) -> None:
+        self.confirm_policy.allow_read_only_bash = value
+
     # ------------------------------------------------------------------ UI
 
     def _build_app(self) -> Application:
@@ -327,11 +409,14 @@ class SpiceTUI:
         has_model_selector = Condition(lambda: bool(self._model_choices))
         has_session_selector = Condition(lambda: bool(self._session_choices))
         has_rewind_selector = Condition(lambda: bool(self._rewind_choices))
+        is_busy = Condition(lambda: self._busy)
         has_overlay = Condition(
-            lambda: self._confirmation_future is not None
-            or bool(self._model_choices)
-            or bool(self._session_choices)
-            or bool(self._rewind_choices)
+            lambda: (
+                self._confirmation_future is not None
+                or bool(self._model_choices)
+                or bool(self._session_choices)
+                or bool(self._rewind_choices)
+            )
         )
 
         @kb.add("c-c", filter=~has_overlay)
@@ -339,7 +424,14 @@ class SpiceTUI:
         def _quit(event) -> None:
             if self._pending_task and not self._pending_task.done():
                 self._pending_task.cancel()
+                return
             event.app.exit()
+
+        @kb.add("escape", filter=~has_overlay & is_busy)
+        def _interrupt_current(event) -> None:
+            if self._pending_task and not self._pending_task.done():
+                self._pending_task.cancel()
+                event.app.invalidate()
 
         @kb.add("pageup")
         def _page_up(event) -> None:
@@ -498,7 +590,7 @@ class SpiceTUI:
                 self._toggle_interaction_mode()
                 event.app.invalidate()
 
-        @kb.add("escape", filter=not_overlay & has_completions)
+        @kb.add("escape", filter=not_overlay & has_completions & ~is_busy)
         def _cancel_completion(event) -> None:
             event.current_buffer.cancel_completion()
 
@@ -540,9 +632,7 @@ class SpiceTUI:
                 self,
                 buffer=self._input_buffer,
                 focus_on_click=True,
-                input_processors=[
-                    BeforeInput("spice ❯ ", style="class:prompt")
-                ],
+                input_processors=[BeforeInput("spice ❯ ", style="class:prompt")],
             ),
             height=3,
             wrap_lines=True,
@@ -569,7 +659,9 @@ class SpiceTUI:
                         ),
                         Window(height=1, char="─", style="class:separator"),
                         self._input_window,
-                        Window(height=1, content=FormattedTextControl(self._mode_fragments)),
+                        Window(
+                            height=1, content=FormattedTextControl(self._mode_fragments)
+                        ),
                     ]
                 ),
                 floats=[
@@ -589,6 +681,10 @@ class SpiceTUI:
                 "prompt": "#67e8f9 bold",
                 "message-area scrollbar.background": "bg:#2b3347",
                 "message-area scrollbar.button": "bg:#5b647c",
+                "message.user-label": "#67e8f9 bold",
+                "message.assistant-label": "#a7f3d0 bold",
+                "message.tool": "#c4b5fd",
+                "message.tool-result": "#86efac",
                 "welcome.border": "#8f99b7",
                 "welcome.dot": "#67e8f9 bold",
                 "welcome.quote": "#f4d99d bold",
@@ -596,6 +692,8 @@ class SpiceTUI:
                 "mode.plan": "#14b8a6 bold",
                 "mode.edit": "#bbf7d0 bold",
                 "mode.sep": "#6b7280",
+                "activity": "#8f99b7",
+                "activity.marker": "#67e8f9 bold",
                 "todo": "#c7d2fe",
                 "todo.title": "#67e8f9 bold",
                 "todo.done": "#a7f3d0",
@@ -658,35 +756,73 @@ class SpiceTUI:
         ]
 
     def _welcome_fragments(self):
-        quote_width = max(get_cwidth(self._welcome_quote_en), get_cwidth(self._welcome_quote_zh))
+        quote_width = max(
+            get_cwidth(self._welcome_quote_en), get_cwidth(self._welcome_quote_zh)
+        )
         width = max(58, min(88, quote_width + 8))
         content_width = width - 4
         dash = "╌" * (width - 2)
         return [
             ("class:welcome.border", "╭" + dash + "╮\n"),
-            *self._welcome_line("• " + self._welcome_quote_en, content_width, "class:welcome.quote"),
-            *self._welcome_line(self._welcome_quote_zh, content_width, "class:welcome.quote"),
+            *self._welcome_line(
+                "• " + self._welcome_quote_en, content_width, "class:welcome.quote"
+            ),
+            *self._welcome_line(
+                self._welcome_quote_zh, content_width, "class:welcome.quote"
+            ),
             ("class:welcome.border", "╰" + dash + "╯\n"),
             ("", "\n"),
         ]
 
     def _mode_fragments(self):
+        fragments = self._activity_fragments()
         if self._agent_session is None:
-            return []
+            return fragments
         mode = self._agent_session.plan_state.mode
         if mode == "plan":
-            return [
-                ("class:mode.plan", " plan mode "),
-                ("class:mode.sep", " | "),
-                ("class:mode", "shift+tab"),
-            ]
+            if fragments:
+                fragments.append(("class:mode.sep", " | "))
+            fragments.extend(
+                [
+                    ("class:mode.plan", " plan mode "),
+                    ("class:mode.sep", " | "),
+                    ("class:mode", "shift+tab"),
+                ]
+            )
+            return fragments
         if self._show_edit_mode_hint:
-            return [
-                ("class:mode", " edit mode "),
-                ("class:mode.sep", " | "),
-                ("class:mode", "shift+tab"),
-            ]
-        return []
+            if fragments:
+                fragments.append(("class:mode.sep", " | "))
+            fragments.extend(
+                [
+                    ("class:mode", " edit mode "),
+                    ("class:mode.sep", " | "),
+                    ("class:mode", "shift+tab"),
+                ]
+            )
+        return fragments
+
+    def _activity_fragments(self):
+        if not getattr(self, "_busy", False):
+            return []
+        now = time.monotonic()
+        started = getattr(self, "_activity_started", None) or now
+        elapsed_seconds = max(0.0, now - started)
+        active_tool = getattr(self, "_active_tool_name", None)
+        if active_tool:
+            label = f"Running {active_tool}"
+        elif getattr(self, "_reasoning_streaming", False):
+            label = "Thinking"
+        elif getattr(self, "_streaming", False):
+            last_delta = getattr(self, "_last_stream_delta_at", None) or now
+            label = "Waiting for model" if now - last_delta >= 2 else "Generating"
+        else:
+            label = getattr(self, "_waiting_label", "Waiting")
+        marker, status = activity_parts(label, elapsed_seconds)
+        return [
+            ("class:activity.marker", f" {marker} "),
+            ("class:activity", status),
+        ]
 
     def _todo_fragments(self):
         if not self._todo_items:
@@ -719,7 +855,9 @@ class SpiceTUI:
             }.get(status, "class:todo.pending")
             item_id = str(item.get("id") or "?")
             content = str(item.get("content") or "(no description)")
-            fragments.extend([(style, f"{_todo_marker(status)} {item_id}. {content}\n")])
+            fragments.extend(
+                [(style, f"{_todo_marker(status)} {item_id}. {content}\n")]
+            )
         remaining = len(self._todo_items) - 5
         if remaining > 0:
             fragments.append(("class:todo.pending", f"... {remaining} more\n"))
@@ -768,9 +906,29 @@ class SpiceTUI:
         fragments = []
         lines = self._message_display_lines()
         for index, line in enumerate(lines):
-            style = "class:thought-label" if line.strip().startswith("Thought for ") else ""
             suffix = "\n" if index < len(lines) - 1 else ""
-            fragments.append((style, line + suffix))
+            if line.startswith("You: "):
+                fragments.extend(
+                    [
+                        ("class:message.user-label", "You:"),
+                        ("", line.removeprefix("You:") + suffix),
+                    ]
+                )
+            elif line.startswith("Spice: "):
+                fragments.extend(
+                    [
+                        ("class:message.assistant-label", "Spice:"),
+                        ("", line.removeprefix("Spice:") + suffix),
+                    ]
+                )
+            elif line.strip().startswith("Thought for "):
+                fragments.append(("class:thought-label", line + suffix))
+            elif line.lstrip().startswith(("tool:", "❯")):
+                fragments.append(("class:message.tool", line + suffix))
+            elif line.startswith("  ") and " -> " in line:
+                fragments.append(("class:message.tool-result", line + suffix))
+            else:
+                fragments.append(("", line + suffix))
         return fragments
 
     def _message_cursor_position(self) -> Point:
@@ -792,7 +950,9 @@ class SpiceTUI:
         if self._message_follow_tail:
             self._message_vertical_scroll = bottom
         else:
-            self._message_vertical_scroll = max(0, min(self._message_vertical_scroll, bottom))
+            self._message_vertical_scroll = max(
+                0, min(self._message_vertical_scroll, bottom)
+            )
 
     def _follow_message_tail(self) -> None:
         self._message_follow_tail = True
@@ -823,7 +983,9 @@ class SpiceTUI:
             return
         if getattr(self, "_rewind_choices", None) and self._move_rewind_choice(step):
             return
-        if getattr(self, "_confirmation_future", None) is not None and self._move_confirmation(step):
+        if getattr(
+            self, "_confirmation_future", None
+        ) is not None and self._move_confirmation(step):
             return
         self._scroll_messages(line_delta)
 
@@ -874,17 +1036,20 @@ class SpiceTUI:
         new_text = current[:start] + text
         self._set_message_text(new_text)
 
-    def _start_waiting_indicator(self) -> None:
+    def _start_waiting_indicator(self, label: str = "Waiting for model") -> None:
         self._waiting_started = time.monotonic()
+        self._waiting_label = label
         self._waiting_start = len(self._message_buffer.text)
-        self._append(self._waiting_indicator_text(0))
+        self._append(self._waiting_indicator_text(0.0))
 
     def _render_waiting_indicator(self) -> None:
         if self._waiting_started is None or self._waiting_start is None:
             return
-        elapsed = max(0, int(time.monotonic() - self._waiting_started))
+        elapsed = max(0.0, time.monotonic() - self._waiting_started)
         current = self._message_buffer.text
-        self._set_message_text(current[: self._waiting_start] + self._waiting_indicator_text(elapsed))
+        self._set_message_text(
+            current[: self._waiting_start] + self._waiting_indicator_text(elapsed)
+        )
         if self._app is not None:
             self._app.invalidate()
 
@@ -892,20 +1057,30 @@ class SpiceTUI:
         if self._waiting_started is None:
             return
         if clear and self._waiting_start is not None:
-            elapsed = max(0, int(time.monotonic() - self._waiting_started))
             current = self._message_buffer.text
-            self._set_message_text(current[: self._waiting_start] + self._waiting_indicator_text(elapsed))
+            self._set_message_text(current[: self._waiting_start])
         self._waiting_started = None
         self._waiting_start = None
         if self._app is not None:
             self._app.invalidate()
 
-    def _waiting_indicator_text(self, elapsed: int) -> str:
-        return f"Thought for {_format_elapsed(elapsed)}\n\n"
+    def _waiting_indicator_text(self, elapsed: float) -> str:
+        return f"{activity_text(self._waiting_label, elapsed)}\n"
+
+    def _finish_reasoning_stream(self) -> None:
+        if not getattr(self, "_reasoning_streaming", False):
+            return
+        self._ensure_newline()
+        self._reasoning_streaming = False
 
     def _capture_rich(self, renderable) -> str:
         output = StringIO()
-        console = Console(file=output, force_terminal=False, color_system=None, width=self._message_window_width())
+        console = Console(
+            file=output,
+            force_terminal=False,
+            color_system=None,
+            width=self._message_window_width(),
+        )
         console.print(renderable)
         return output.getvalue()
 
@@ -929,7 +1104,11 @@ class SpiceTUI:
                 return
             if len(table_lines) >= 2 and _is_table_divider(table_lines[1]):
                 flush_markdown()
-                chunks.append(_render_plain_table(table_lines, width=self._message_window_width()).rstrip())
+                chunks.append(
+                    _render_plain_table(
+                        table_lines, width=self._message_window_width()
+                    ).rstrip()
+                )
             else:
                 markdown_lines.extend(table_lines)
             table_lines.clear()
@@ -951,7 +1130,12 @@ class SpiceTUI:
 
         flush_table()
         flush_markdown()
-        return _compact_blank_lines("\n\n".join(chunk for chunk in chunks if chunk), max_blank_lines=2).rstrip() + "\n"
+        return (
+            _compact_blank_lines(
+                "\n\n".join(chunk for chunk in chunks if chunk), max_blank_lines=2
+            ).rstrip()
+            + "\n"
+        )
 
     def _render_table_text(self, table: Table) -> str:
         return self._capture_rich(table)
@@ -959,7 +1143,9 @@ class SpiceTUI:
     def _move_confirmation(self, step: int) -> bool:
         if self._confirmation_future is None or not self._confirmation_choices:
             return False
-        self._confirmation_index = (self._confirmation_index + step) % len(self._confirmation_choices)
+        self._confirmation_index = (self._confirmation_index + step) % len(
+            self._confirmation_choices
+        )
         self._render_confirmation()
         return True
 
@@ -983,7 +1169,7 @@ class SpiceTUI:
         self._confirmation_choices = []
         self._replace_from(self._confirmation_start, "")
         if not future.done():
-            future.set_result("deny")
+            future.set_result(None)
         return True
 
     def _render_confirmation(self) -> None:
@@ -997,50 +1183,63 @@ class SpiceTUI:
         self._replace_from(self._confirmation_start, "\n".join(lines) + "\n")
 
     async def confirm(self, tool_name: str, args: dict) -> bool:
-        if _is_file_edit_tool(tool_name) and self._allow_file_edits:
-            return True
-        if tool_name == "bash" and self._allow_read_only_bash and _is_read_only_bash_command(args):
-            return True
+        return await self.confirm_policy.confirm(
+            tool_name,
+            args,
+            _TuiToolConfirmPort(self, tool_name, args),
+        )
 
+    async def _port_choose(self, request: ChoiceRequest) -> str | None:
+        if not request.items:
+            return None
         self._ensure_newline()
-        if not _is_file_edit_tool(tool_name):
-            args_preview, _ = _preview_text(str(args), max_chars=700, max_lines=8)
-            self._append(f"\nConfirm {tool_name}\n{args_preview}\n")
-
-        self._confirmation_question = _confirmation_question(tool_name, args)
+        self._confirmation_question = request.title
         self._confirmation_choices = [
-            ("allow", "Yes", ""),
-            ("deny", "No", ""),
+            (item.id, item.label, item.detail) for item in request.items
         ]
-        if _is_file_edit_tool(tool_name):
-            self._confirmation_choices.insert(
-                1,
-                ("allow_all_edits", "Yes, allow all edits during this session", ""),
-            )
-        if tool_name == "bash" and _is_read_only_bash_command(args):
-            self._confirmation_choices.insert(
-                1,
-                ("allow_read_only_bash", "Yes, allow read-only shell commands this session", "grep/sed/rg/cat/ls"),
-            )
         self._confirmation_index = 0
+        if request.current_id:
+            for index, (value, _, _) in enumerate(self._confirmation_choices):
+                if value == request.current_id:
+                    self._confirmation_index = index
+                    break
         self._confirmation_start = len(self._message_buffer.text)
         self._confirmation_future = asyncio.get_running_loop().create_future()
         self._render_confirmation()
         self._app.invalidate()
-
         try:
-            selected = await self._confirmation_future
+            return await self._confirmation_future
         except asyncio.CancelledError:
             self._confirmation_future = None
             self._confirmation_choices = []
             raise
-        if selected == "allow_all_edits":
-            self._allow_file_edits = True
-            return True
-        if selected == "allow_read_only_bash":
-            self._allow_read_only_bash = True
-            return True
-        return selected == "allow"
+
+    async def _port_confirm(self, request: ConfirmRequest) -> str:
+        selected = await self._port_choose(
+            ChoiceRequest(
+                title=request.question,
+                items=tuple(
+                    ChoiceItem(id=c.id, label=c.label, detail=c.detail)
+                    for c in request.choices
+                ),
+                current_id=request.current_id,
+            )
+        )
+        return selected or "deny"
+
+    def _paint_command_result(self, result: CommandResult) -> None:
+        for view in result.views:
+            if isinstance(view, TextView):
+                self._ensure_newline()
+                self._append(view.text + "\n")
+            elif isinstance(view, TableView):
+                table = Table(*(view.columns), title=view.title)
+                for row in view.rows:
+                    table.add_row(*row)
+                self._append_table(table)
+            elif isinstance(view, PanelView):
+                self._ensure_newline()
+                self._append(f"[{view.title}]\n{view.body}\n")
 
     async def _select_plan_action(self) -> str | None:
         self._ensure_newline()
@@ -1064,7 +1263,9 @@ class SpiceTUI:
 
     async def _confirm_reset(self) -> bool:
         self._ensure_newline()
-        self._confirmation_question = "Reset current session? This clears all messages but keeps the session id."
+        self._confirmation_question = (
+            "Reset current session? This clears all messages but keeps the session id."
+        )
         self._confirmation_choices = [
             ("yes", "Yes", "clear messages"),
             ("no", "No", "return to chat"),
@@ -1110,7 +1311,9 @@ class SpiceTUI:
             return
         registry = ModelRegistry()
         current = self._agent_session.model
-        self._model_choices = sorted(registry.all(), key=lambda item: (item.provider, item.id))
+        self._model_choices = sorted(
+            registry.all(), key=lambda item: (item.provider, item.id)
+        )
         self._model_choice_index = next(
             (
                 index
@@ -1127,7 +1330,9 @@ class SpiceTUI:
         if not self._model_choices:
             return False
         if abs(step) == 1:
-            self._model_choice_index = (self._model_choice_index + step) % len(self._model_choices)
+            self._model_choice_index = (self._model_choice_index + step) % len(
+                self._model_choices
+            )
         else:
             self._model_choice_index = max(
                 0,
@@ -1158,16 +1363,28 @@ class SpiceTUI:
             return
         current = self._agent_session.model
         lines = ["", "Select model (up/down, enter, esc)", ""]
-        start, end = self._selector_slice(len(self._model_choices), self._model_choice_index)
+        start, end = self._selector_slice(
+            len(self._model_choices), self._model_choice_index
+        )
         if start:
             lines.append(f"  ↑ {start} more")
         for index in range(start, end):
             model = self._model_choices[index]
             arrow = "❯" if index == self._model_choice_index else " "
-            active = "*" if model.provider == current.provider and model.id == current.id else " "
-            key_status = "key ok" if get_api_key(model.provider, env_names=model.api_key_envs) else "missing key"
+            active = (
+                "*"
+                if model.provider == current.provider and model.id == current.id
+                else " "
+            )
+            key_status = (
+                "key ok"
+                if get_api_key(model.provider, env_names=model.api_key_envs)
+                else "missing key"
+            )
             provider = model.provider_name or model.provider
-            lines.append(f"{arrow} {active} {model.provider}/{model.id}  {provider}  {key_status}")
+            lines.append(
+                f"{arrow} {active} {model.provider}/{model.id}  {provider}  {key_status}"
+            )
         if end < len(self._model_choices):
             lines.append(f"  ↓ {len(self._model_choices) - end} more")
         lines.append("")
@@ -1191,7 +1408,9 @@ class SpiceTUI:
 
     def _start_session_selector(self, *, mode: str = "resume") -> None:
         store = create_session_store(load_config(), cwd=Path.cwd())
-        rows = store.list(limit=SESSION_PICKER_LIMIT, cwd=Path.cwd(), include_empty=True)
+        rows = store.list(
+            limit=SESSION_PICKER_LIMIT, cwd=Path.cwd(), include_empty=True
+        )
         if not rows:
             self._ensure_newline()
             self._append("No sessions found for this workspace.\n")
@@ -1227,7 +1446,9 @@ class SpiceTUI:
         if not self._session_choices:
             return False
         if abs(step) == 1:
-            self._session_choice_index = (self._session_choice_index + step) % len(self._session_choices)
+            self._session_choice_index = (self._session_choice_index + step) % len(
+                self._session_choices
+            )
         else:
             self._session_choice_index = max(
                 0,
@@ -1267,7 +1488,9 @@ class SpiceTUI:
             if self._agent_session and self._agent_session.session
             else None
         )
-        action = "session to delete" if self._session_choice_mode == "delete" else "session"
+        action = (
+            "session to delete" if self._session_choice_mode == "delete" else "session"
+        )
         lines = ["", f"Select {action} (up/down, enter, esc)", ""]
         start, end = self._selector_slice(
             len(self._session_choice_rows),
@@ -1296,8 +1519,14 @@ class SpiceTUI:
         session_id = self._agent_session.session_id
         try:
             info = store.info(session_id)
-            active_path_ids = {entry.id for entry in store.path_entries(session_id)} if info.leaf_id else set()
-            entries = [entry for entry in store.entries(session_id) if entry.type != "leaf"]
+            active_path_ids = (
+                {entry.id for entry in store.path_entries(session_id)}
+                if info.leaf_id
+                else set()
+            )
+            entries = [
+                entry for entry in store.entries(session_id) if entry.type != "leaf"
+            ]
         except ValueError as exc:
             self._ensure_newline()
             self._append(f"Error: {exc}\n")
@@ -1306,7 +1535,7 @@ class SpiceTUI:
         self._rewind_choice_rows = [
             (
                 entry.id,
-                f"{entry.type}  {_entry_active_label(entry.id, info.leaf_id, active_path_ids)}  {_entry_preview(entry.data)}".strip(),
+                f"{entry.type}  {entry_active_label(entry.id, info.leaf_id, active_path_ids)}  {entry_preview(entry.data)}".strip(),
             )
             for entry in entries
         ]
@@ -1323,7 +1552,9 @@ class SpiceTUI:
         if not self._rewind_choices:
             return False
         if abs(step) == 1:
-            self._rewind_choice_index = (self._rewind_choice_index + step) % len(self._rewind_choices)
+            self._rewind_choice_index = (self._rewind_choice_index + step) % len(
+                self._rewind_choices
+            )
         else:
             self._rewind_choice_index = max(
                 0,
@@ -1353,7 +1584,9 @@ class SpiceTUI:
 
     def _render_rewind_selector(self) -> None:
         lines = ["", "Select rewind entry (up/down, enter, esc)", ""]
-        start, end = self._selector_slice(len(self._rewind_choice_rows), self._rewind_choice_index)
+        start, end = self._selector_slice(
+            len(self._rewind_choice_rows), self._rewind_choice_index
+        )
         if start:
             lines.append(f"  ↑ {start} more")
         for index in range(start, end):
@@ -1388,103 +1621,64 @@ class SpiceTUI:
         if self._agent_session is None or not text.startswith("/"):
             return False
 
-        command, _, raw_arg = text.partition(" ")
-        arg = raw_arg.strip()
-        if command in {"/exit", "/quit"}:
+        from spice.interactive.commands import SlashCommandRegistry as CoreRegistry
+
+        registry = CoreRegistry(self._agent_session.extensions)
+        port = _TuiInteractivePort(self)
+        ctx = CommandContext(
+            session=self._agent_session,
+            cwd=Path.cwd(),
+            port=port,
+            raw=text,
+            args="",
+            confirm_policy=self.confirm_policy,
+            extras={
+                "extension_context": SimpleNamespace(
+                    console=_TuiConsole(self),
+                    agent_session=self._agent_session,
+                    cwd=Path.cwd(),
+                ),
+                "registry": registry,
+            },
+        )
+        result = await registry.execute(text, ctx)
+        if result.exit_requested:
             self._app.exit()
             return True
-        if command == "/clear":
-            self._clear_conversation()
-            return True
-        if command == "/reset":
-            await self._reset_session()
-            return True
-        if command == "/delete":
-            await self._delete_session(arg)
-            return True
-        if command == "/help":
-            self._show_help()
-            return True
-        if command == "/settings":
-            self._show_settings()
-            return True
-        if command == "/tools":
-            self._show_tools()
-            return True
-        if command == "/subagent":
-            self._handle_subagent_command(arg)
-            return True
-        if command == "/models":
-            self._show_models(arg)
-            return True
-        if command == "/sessions":
-            self._show_sessions()
-            return True
-        if command == "/resume":
-            self._resume_session(arg)
-            return True
-        if command == "/history":
-            self._show_history(arg)
-            return True
-        if command == "/rewind":
-            self._rewind_session(arg)
-            return True
-        if command == "/compact":
-            self._show_compact()
-            return True
-        if command == "/plan":
-            await self._handle_plan_command(arg)
-            return True
-        if command in {"/task", "/goal"}:
-            await self._handle_sustained_goal_command(arg, command=command.removeprefix("/"))
-            return True
-        if command == "/skills":
-            self._show_skills()
-            return True
-        if text.startswith("/skill:"):
-            self._show_skill(text.removeprefix("/skill:").strip())
-            return True
-        if self._agent_session.extensions:
-            command_name, _, args = text.removeprefix("/").partition(" ")
-            if command_name in self._agent_session.extensions.commands():
-                result = await self._agent_session.extensions.handle_command(
-                    command_name,
-                    args.strip(),
-                    SimpleNamespace(console=_TuiConsole(self), agent_session=self._agent_session, cwd=Path.cwd()),
-                )
-                if result is not None:
-                    self._ensure_newline()
-                    self._append(str(result) + "\n")
-                return True
 
-        self._ensure_newline()
-        self._append(f"Unknown command: {text}\nRun /help to see supported TUI commands.\n")
-        return True
-
-    def _show_help(self) -> None:
-        table = Table("Command", "Description")
-        table.add_row(
-            "/models [provider/model]",
-            "Show models, or switch model when an id is provided.",
+        previous_session = self._agent_session
+        new_session = result.session
+        replacing_session = (
+            new_session is not None and new_session is not previous_session
         )
-        table.add_row("/sessions", "Show recent sessions for this workspace.")
-        table.add_row("/resume <session-id>", "Resume a previous session by id.")
-        table.add_row("/clear", "Clear the visible conversation without deleting the session.")
-        table.add_row("/reset", "Clear all messages from the current session after confirmation.")
-        table.add_row("/delete [session-id|current]", "Delete a session after confirmation.")
-        table.add_row("/history [--tree|--raw]", "Show current session history.")
-        table.add_row("/rewind <entry-id>", "Move the current session leaf to an entry.")
-        table.add_row("/compact", "Show context compaction status.")
-        table.add_row("/plan [task|execute|cancel]", "Switch to plan mode, plan a task, or execute/cancel the plan.")
-        table.add_row("/task <objective>", "Start or continue a sustained task.")
-        table.add_row("/goal <objective>", "Start or continue a sustained goal.")
-        table.add_row("/settings", "Show current runtime settings.")
-        table.add_row("/tools", "Show available toolsets and tools.")
-        table.add_row("/subagent [on|off|status]", "Control subagent tools for this session.")
-        table.add_row("/skills", "List installed skills.")
-        table.add_row("/skill:<name>", "Show a skill file.")
-        table.add_row("/quit", "Exit the TUI.")
-        self._append_table(table)
+        if result.clear_requested or (
+            replacing_session and result.replay_session_history
+        ):
+            self._clear_conversation()
+        if new_session is not None and new_session is not previous_session:
+            self.confirm_policy = ConfirmPolicy()
+            set_confirm = getattr(new_session, "set_confirm", None)
+            if set_confirm is not None:
+                set_confirm(self.confirm)
+            else:
+                new_session.confirm = self.confirm
+            self._agent_session = new_session
+            self._bind_trace_session()
+            self._refresh_completer()
+            close = getattr(previous_session, "aclose", None)
+            if close is not None:
+                await close()
+
+        self._paint_command_result(result)
+        if replacing_session and new_session is not None:
+            self._ensure_newline()
+            self._append(f"Session: {new_session.session_label}\n")
+            self._append(f"Model: {new_session.runtime_model_label}\n")
+            if result.replay_session_history:
+                self._display_session_history()
+        if result.followup_prompt:
+            await self._run_prompt(result.followup_prompt)
+        return True
 
     def _show_settings(self) -> None:
         if self._agent_session is None:
@@ -1494,29 +1688,65 @@ class SpiceTUI:
         table.add_row("session", self._agent_session.session_label)
         table.add_row("cwd", str(Path.cwd()))
         table.add_row("model", self._model_label())
+        table.add_row(
+            "protocol", self._agent_session.model.protocol or "provider default"
+        )
         table.add_row("default model", f"{config.provider}/{config.model}")
         table.add_row("temperature", str(config.temperature))
         table.add_row("memory.enabled", str(config.memory_enabled).lower())
-        table.add_row("subagents.enabled", str(self._agent_session.subagents_enabled).lower())
-        table.add_row("subagents.max_concurrent", str(self._agent_session.subagent_manager.max_concurrent))
+        table.add_row(
+            "subagents.enabled", str(self._agent_session.subagents_enabled).lower()
+        )
+        table.add_row(
+            "subagents.max_concurrent",
+            str(self._agent_session.subagent_manager.max_concurrent),
+        )
         table.add_row("logging.retention_days", str(config.logging_retention_days))
-        table.add_row("tools.max_concurrency", str(config.tools.get("max_concurrency", 4)))
-        table.add_row("tools.default_timeout_seconds", str(config.tools.get("default_timeout_seconds", 120)))
-        table.add_row("model retry", str(config.model_routing["retry"].get("enabled", True)).lower())
-        table.add_row("model retry attempts", str(config.model_routing["retry"].get("maxAttempts", 3)))
-        table.add_row("model fallback", str(config.model_routing["fallback"].get("enabled", False)).lower())
-        table.add_row("fallback profiles", ", ".join(config.model_routing["fallback"].get("profiles", [])) or "(none)")
-        table.add_row("output tokens", str(self.agent_session.model.output_tokens))
+        table.add_row(
+            "tools.max_concurrency", str(config.tools.get("max_concurrency", 4))
+        )
+        table.add_row(
+            "tools.default_timeout_seconds",
+            str(config.tools.get("default_timeout_seconds", 120)),
+        )
+        table.add_row(
+            "model retry",
+            str(config.model_routing["retry"].get("enabled", True)).lower(),
+        )
+        table.add_row(
+            "model retry attempts",
+            str(config.model_routing["retry"].get("maxAttempts", 3)),
+        )
+        table.add_row(
+            "model fallback",
+            str(config.model_routing["fallback"].get("enabled", False)).lower(),
+        )
+        table.add_row(
+            "fallback profiles",
+            ", ".join(config.model_routing["fallback"].get("profiles", [])) or "(none)",
+        )
+        table.add_row("output tokens", str(self._agent_session.model.output_tokens))
         table.add_row("mode", self._agent_session.plan_state.mode)
         if self._agent_session.todo_state.status_line():
             table.add_row("todo", self._agent_session.todo_state.status_line())
-        table.add_row("file edit approvals", "session allowed" if self._allow_file_edits else "ask")
+        table.add_row(
+            "tool approvals",
+            "all tools allowed for session" if self._allow_all_tools else "ask",
+        )
+        table.add_row(
+            "file edit approvals",
+            "session allowed" if self._allow_file_edits else "ask",
+        )
         self._append_table(table)
 
     def _show_tools(self) -> None:
         memory_enabled = load_config().memory_enabled
-        subagents_enabled = bool(self._agent_session and self._agent_session.subagents_enabled)
-        registry = create_all_tools(memory_enabled=memory_enabled, subagents_enabled=subagents_enabled)
+        subagents_enabled = bool(
+            self._agent_session and self._agent_session.subagents_enabled
+        )
+        registry = create_all_tools(
+            memory_enabled=memory_enabled, subagents_enabled=subagents_enabled
+        )
         table = Table("Toolset", "Tools")
         for name, tools in TOOLSETS.items():
             if name == "memory" and not memory_enabled:
@@ -1524,8 +1754,17 @@ class SpiceTUI:
             if name == "subagent" and not subagents_enabled:
                 continue
             table.add_row(name, ", ".join(tools))
-        table.add_row("read-only", ", ".join(name for name in READ_ONLY_TOOLS if name in registry))
-        table.add_row("parallel", ", ".join(name for name, tool in registry.items() if tool.concurrency == "parallel"))
+        table.add_row(
+            "read-only", ", ".join(name for name in READ_ONLY_TOOLS if name in registry)
+        )
+        table.add_row(
+            "parallel",
+            ", ".join(
+                name
+                for name, tool in registry.items()
+                if tool.concurrency == "parallel"
+            ),
+        )
         self._append_table(table)
 
     def _handle_subagent_command(self, arg: str) -> None:
@@ -1552,8 +1791,12 @@ class SpiceTUI:
             return
         active_tools = self._agent_session.get_active_tools()
         table = Table("Setting", "Value")
-        table.add_row("session enabled", str(self._agent_session.subagents_enabled).lower())
-        table.add_row("max concurrent", str(self._agent_session.subagent_manager.max_concurrent))
+        table.add_row(
+            "session enabled", str(self._agent_session.subagents_enabled).lower()
+        )
+        table.add_row(
+            "max concurrent", str(self._agent_session.subagent_manager.max_concurrent)
+        )
         table.add_row("mode", self._agent_session.plan_state.mode)
         table.add_row("tool available", str("spawn_subagents" in active_tools).lower())
         self._append_table(table)
@@ -1616,7 +1859,9 @@ class SpiceTUI:
     async def _delete_session(self, target: str) -> None:
         if self._agent_session is None:
             return
-        current_session_id = self._agent_session.session_id if self._agent_session.session else None
+        current_session_id = (
+            self._agent_session.session_id if self._agent_session.session else None
+        )
         session_id = target
         if target == "current":
             if not current_session_id:
@@ -1629,13 +1874,17 @@ class SpiceTUI:
             return
         else:
             try:
-                session_id = self._agent_session.session_store.resolve(target, cwd=Path.cwd()).id
+                session_id = self._agent_session.session_store.resolve(
+                    target, cwd=Path.cwd()
+                ).id
             except ValueError as exc:
                 self._ensure_newline()
                 self._append(f"Delete failed: {exc}\n")
                 return
 
-        confirmed = await self._confirm_delete_session(session_id, current=session_id == current_session_id)
+        confirmed = await self._confirm_delete_session(
+            session_id, current=session_id == current_session_id
+        )
         if not confirmed:
             self._ensure_newline()
             self._append("Delete cancelled.\n")
@@ -1662,6 +1911,8 @@ class SpiceTUI:
             session_store=self._agent_session.session_store,
             extension_manager=self._agent_session.extensions,
         )
+        self.confirm_policy = ConfirmPolicy()
+        self._bind_trace_session()
         self._clear_conversation()
         self._append(f"Deleted session: {session_id}\n")
         self._append(f"Session: {self._agent_session.session_label}\n")
@@ -1684,6 +1935,8 @@ class SpiceTUI:
             self._ensure_newline()
             self._append(f"Resume failed: {exc}\n")
             return
+        self.confirm_policy = ConfirmPolicy()
+        self._bind_trace_session()
         # A resumed session replaces the current conversation view. Resetting
         # follow-tail is essential when the previous view was scrolled up.
         self._clear_conversation()
@@ -1766,10 +2019,14 @@ class SpiceTUI:
         table.add_row("Leaf", active_context.leaf_id or "")
         self._append_table(table)
         for message in active_context.messages:
-            title = message.role if not message.name else f"{message.role}:{message.name}"
+            title = (
+                message.role if not message.name else f"{message.role}:{message.name}"
+            )
             body = message.content or "<empty>"
             if message.tool_calls:
-                calls = ", ".join(f"{call.name}({call.id})" for call in message.tool_calls)
+                calls = ", ".join(
+                    f"{call.name}({call.id})" for call in message.tool_calls
+                )
                 body = f"{body}\n\nTool calls: {calls}".strip()
             self._ensure_newline()
             self._append(f"{title}\n{body}\n")
@@ -1783,7 +2040,11 @@ class SpiceTUI:
         session_id = self._agent_session.session_id
         try:
             info = store.info(session_id)
-            active_path_ids = {entry.id for entry in store.path_entries(session_id)} if info.leaf_id else set()
+            active_path_ids = (
+                {entry.id for entry in store.path_entries(session_id)}
+                if info.leaf_id
+                else set()
+            )
             entries = store.entries(session_id)
         except ValueError as exc:
             self._ensure_newline()
@@ -1791,8 +2052,18 @@ class SpiceTUI:
             return
         table = Table("Entry", "Parent", "Type", "Active", "Preview")
         for entry in entries:
-            active = "yes" if entry.id == info.leaf_id else ("path" if entry.id in active_path_ids else "")
-            table.add_row(entry.id, entry.parent_id or "", entry.type, active, _entry_preview(entry.data))
+            active = (
+                "yes"
+                if entry.id == info.leaf_id
+                else ("path" if entry.id in active_path_ids else "")
+            )
+            table.add_row(
+                entry.id,
+                entry.parent_id or "",
+                entry.type,
+                active,
+                entry_preview(entry.data),
+            )
         self._append_table(table)
 
     def _rewind_session(self, entry_id: str) -> None:
@@ -1810,11 +2081,113 @@ class SpiceTUI:
             self._append(f"Error: {exc}\n")
             return
         self._ensure_newline()
-        self._append(f"Rewound session: {self._agent_session.session_id} -> {entry_id}\n")
+        self._append(
+            f"Rewound session: {self._agent_session.session_id} -> {entry_id}\n"
+        )
 
-    def _show_compact(self) -> None:
+    async def _show_compact(self, args: str = "") -> None:
+        session = self._agent_session
         self._ensure_newline()
-        self._append("Manual compaction is reserved in the command registry, but the compaction engine is not implemented yet.\n")
+        if session is None or session.session is None:
+            self._append("No session has been created yet.\n")
+            return
+        if args in {"status", "--status"}:
+            status = session.compaction_status()
+            threshold = (
+                str(status.threshold_tokens)
+                if status.threshold_tokens is not None
+                else "n/a"
+            )
+            self._append(
+                f"Compaction status: estimated={status.estimated_tokens} threshold={threshold} "
+                f"reserve={status.reserve_tokens} auto={'yes' if status.should_compact else 'no'} "
+                f"reason={status.reason}\n"
+            )
+            return
+        try:
+            result = await session.compact(
+                focus=args or None, reason="manual", force=True
+            )
+        except Exception as exc:
+            self._append(f"Compaction failed: {exc}\n")
+            return
+        self._append(
+            f"Compacted session: ~{result.tokens_before} -> ~{result.tokens_after} tokens\n"
+        )
+
+    async def _handle_memory_command(self, args: str) -> None:
+        session = self._agent_session
+        if session is None:
+            return
+        words = args.split()
+        action = words[0].lower() if words else "project"
+        store = session.memory_store
+        if action == "status":
+            status = store.status()
+            table = Table("Memory", "Usage")
+            table.add_row("Project", status.get("project_usage") or "n/a")
+            table.add_row("User", status["user_usage"])
+            table.add_row("Global", status["memory_usage"])
+            table.add_row("Unprocessed history", str(status["unprocessed_count"]))
+            table.add_row("Workspace", status.get("workspace") or "n/a")
+            self._append_table(table)
+            return
+        if action == "show":
+            scope = words[1].lower() if len(words) > 1 else "project"
+            target = {"user": "user", "global": "memory", "project": "project"}.get(
+                scope
+            )
+            if target is None:
+                self._append("Usage: /memory show [user|global|project]\n")
+                return
+            entries = store.read_entries(target)
+            self._append(
+                f"{scope} memory:\n"
+                + ("\n\n".join(entries) if entries else "(empty)")
+                + "\n"
+            )
+            return
+        if not session.config.memory_enabled:
+            self._append(
+                "Long-term memory is disabled. Run `spice memory enable` first.\n"
+            )
+            return
+        if action not in {"distill", "all", "project", "global"}:
+            self._append(
+                "Usage: /memory [project|global|all|status|show [user|global|project]]\n"
+            )
+            return
+        distill_scope: Literal["all", "global", "project"] = (
+            "project"
+            if action == "project"
+            else "global"
+            if action == "global"
+            else "all"
+        )
+        try:
+            result = await session.distill_current_memory(scope=distill_scope)
+        except Exception as exc:
+            self._append(f"Memory distillation failed: {exc}\n")
+            return
+        if result.get("processed", 0) == 0:
+            self._append(
+                str(result.get("message", "No conversation content to distill.")) + "\n"
+            )
+        elif result.get("success"):
+            self._append(
+                "Memory updated: "
+                f"adds={result.get('adds', 0)} replacements={result.get('replacements', 0)} "
+                f"removals={result.get('removals', 0)}\n"
+            )
+        else:
+            self._append(
+                str(
+                    result.get(
+                        "message", "Memory review completed with skipped changes."
+                    )
+                )
+                + "\n"
+            )
 
     def _show_skills(self) -> None:
         result = load_skills(cwd=Path.cwd())
@@ -1833,7 +2206,7 @@ class SpiceTUI:
             self._append("Usage: /skill:<name>\n")
             return
         try:
-            content = read_skill_file(name, cwd=Path.cwd())
+            content = read_skill_content(name, cwd=Path.cwd())
         except ValueError as exc:
             self._ensure_newline()
             self._append(f"{exc}\n")
@@ -1845,10 +2218,12 @@ class SpiceTUI:
     def _refresh_completer(self) -> None:
         if self._agent_session is None:
             return
-        slash_completer = SlashCommandRegistry(self._agent_session.extensions).completer()
+        slash_completer = SlashCommandRegistry(
+            self._agent_session.extensions
+        ).completer()
         completer = SpiceInputCompleter(slash_completer, cwd=Path.cwd())
         self._input_buffer.completer = completer
-        self._input_buffer.complete_while_typing = lambda: True
+        self._input_buffer.complete_while_typing = Condition(lambda: True)
 
     def _toggle_interaction_mode(self) -> None:
         if self._agent_session is None:
@@ -1913,7 +2288,9 @@ class SpiceTUI:
             self._append(f"Sustained {command} cancelled.\n")
             return
         if action == "complete":
-            force, note = _parse_force_note(rest)
+            from spice.interactive.commands import parse_force_note
+
+            force, note = parse_force_note(rest)
             try:
                 self._agent_session.complete_long_task(note=note, force=force)
             except ValueError as exc:
@@ -1927,7 +2304,9 @@ class SpiceTUI:
         self._agent_session.start_long_task(objective)
         self._ensure_newline()
         self._append(f"Sustained {command} started.\n")
-        await self._run_prompt(_sustained_goal_prompt(objective, command=command))
+        from spice.interactive.commands import sustained_goal_prompt
+
+        await self._run_prompt(sustained_goal_prompt(objective, command=command))
 
     # --------------------------------------------------------------- input
 
@@ -1957,7 +2336,11 @@ class SpiceTUI:
             self._pending_task = asyncio.create_task(self._run_slash_command(text))
             return True
 
-        if self._agent_session and self._agent_session.plan_state.is_plan_mode and _is_execute_request(text):
+        if (
+            self._agent_session
+            and self._agent_session.plan_state.is_plan_mode
+            and is_execute_request(text)
+        ):
             prompt = self._agent_session.approve_plan("manual")
             self._ensure_newline()
             self._append("Switched to edit mode. Executing the approved plan.\n")
@@ -1965,7 +2348,7 @@ class SpiceTUI:
             return True
 
         self._ensure_turn_gap()
-        self._append(f"You: {text}\n")
+        self._append(f"You: {text}\n\n")
         self._pending_task = asyncio.create_task(self._run_prompt(text))
         return True
 
@@ -1974,6 +2357,9 @@ class SpiceTUI:
             return
         self._busy = True
         self._streaming = False
+        self._activity_started = time.monotonic()
+        self._last_stream_delta_at = None
+        self._active_tool_name = None
         refresh_task = asyncio.create_task(self._refresh_waiting_indicator())
         try:
             async for evt in self._agent_session.prompt(message):
@@ -1996,26 +2382,34 @@ class SpiceTUI:
             self._stop_waiting_indicator(clear=True)
             self._busy = False
             self._streaming = False
+            self._activity_started = None
+            self._last_stream_delta_at = None
+            self._active_tool_name = None
             self._ensure_newline()
             self._app.invalidate()
 
     async def _refresh_waiting_indicator(self) -> None:
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.125)
             self._render_waiting_indicator()
             self._app.invalidate()
 
     async def _handle_plan_ready(self) -> None:
         if self._agent_session is None:
             return
-        if not self._agent_session.plan_state.is_plan_mode or not self._agent_session.plan_state.steps:
+        if (
+            not self._agent_session.plan_state.is_plan_mode
+            or not self._agent_session.plan_state.steps
+        ):
             return
         selected = await self._select_plan_action()
         if selected == "auto":
             self._allow_file_edits = True
             prompt = self._agent_session.approve_plan("auto")
             self._ensure_newline()
-            self._append("Switched to edit mode. Executing with file edits auto-approved for this session.\n")
+            self._append(
+                "Switched to edit mode. Executing with file edits auto-approved for this session.\n"
+            )
             await self._run_prompt(prompt)
 
     # ------------------------------------------------------------- events
@@ -2026,11 +2420,25 @@ class SpiceTUI:
         if isinstance(event, TurnStartEvent):
             self._flush_compact_tool_group()
             self._ensure_newline()
-            self._start_waiting_indicator()
+            self._start_waiting_indicator("Waiting for model")
             self._response_parts = []
             self._streaming = False
+            self._last_stream_delta_at = None
+            self._active_tool_name = None
+        elif isinstance(event, ReasoningDeltaEvent):
+            self._stop_waiting_indicator(clear=True)
+            self._last_stream_delta_at = time.monotonic()
+            self._active_tool_name = None
+            if not self._reasoning_streaming:
+                self._flush_compact_tool_group()
+                self._append("Thinking: ")
+                self._reasoning_streaming = True
+            self._append(event.text)
         elif isinstance(event, TextDeltaEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
+            self._last_stream_delta_at = time.monotonic()
+            self._active_tool_name = None
             if not self._streaming:
                 self._flush_compact_tool_group()
                 self._append("Spice: ")
@@ -2043,6 +2451,7 @@ class SpiceTUI:
             self._append(event.text)
         elif isinstance(event, AssistantMessageEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             if event.tool_calls and not (event.text or "").strip():
                 self._streaming = False
                 self._response_parts = []
@@ -2053,37 +2462,50 @@ class SpiceTUI:
                 self._append("Spice: ")
                 self._response_start = len(self._message_buffer.text)
             if text.strip():
-                self._replace_from(self._response_start, self._render_markdown_text(text))
+                self._replace_from(
+                    self._response_start, self._render_markdown_text(text)
+                )
             self._streaming = False
             self._response_parts = []
             self._ensure_newline()
         elif isinstance(event, ModelRetryEvent):
             self._stop_waiting_indicator(clear=True)
+            self._last_stream_delta_at = None
+            self._active_tool_name = None
             self._ensure_newline()
             self._append(
                 f"Model request failed temporarily. Retrying {event.next_attempt}/{event.max_attempts} "
                 f"in {event.delay_seconds:.1f}s ({event.provider}/{event.model}).\n"
             )
+            self._start_waiting_indicator("Retrying model request")
         elif isinstance(event, ModelFallbackEvent):
             self._stop_waiting_indicator(clear=True)
+            self._last_stream_delta_at = None
+            self._active_tool_name = None
             self._ensure_newline()
             self._append(
                 f"Model fallback: {event.from_provider}/{event.from_model} -> "
                 f"{event.to_provider}/{event.to_model} (this turn, reason: {event.reason}).\n"
             )
+            self._start_waiting_indicator("Waiting for fallback model")
         elif isinstance(event, ToolExecutionStartEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
+            self._active_tool_name = event.tool_name
             self._ensure_newline()
             args = event.args or {}
             self._pending_tool_args[event.tool_call_id] = args
             if event.tool_name == "update_todo":
+                self._start_waiting_indicator(f"Running {event.tool_name}")
                 return
             start = format_tool_start(event.tool_name, args)
             if event.tool_name in COMPACTABLE_TOOL_NAMES:
                 self._start_compact_tool(event.tool_name, start)
+                self._start_waiting_indicator(f"Running {event.tool_name}")
                 return
             self._flush_compact_tool_group()
             self._append(f"{start}\n")
+            self._start_waiting_indicator(f"Running {event.tool_name}")
         elif isinstance(event, ToolExecutionUpdateEvent):
             self._stop_waiting_indicator(clear=True)
             self._flush_compact_tool_group()
@@ -2091,29 +2513,52 @@ class SpiceTUI:
             self._append(event.text)
         elif isinstance(event, ToolExecutionEndEvent):
             self._stop_waiting_indicator(clear=True)
+            self._active_tool_name = None
+            self._last_stream_delta_at = None
             self._ensure_newline()
             had_start = event.tool_call_id in self._pending_tool_args
             args = self._pending_tool_args.pop(event.tool_call_id, {})
             summary = format_tool_end(event.tool_name, args, event.result)
             if event.tool_name == "update_todo" and not event.result.is_error:
-                self._todo_items, self._todo_summary = _todo_items_from_result(event.result)
+                self._todo_items, self._todo_summary = _todo_items_from_result(
+                    event.result
+                )
                 self._app.invalidate()
                 return
-            if had_start and event.tool_name in COMPACTABLE_TOOL_NAMES and self._compact_tool_group is not None:
-                self._finish_compact_tool(event.tool_name, summary, is_error=event.result.is_error)
+            if (
+                had_start
+                and event.tool_name in COMPACTABLE_TOOL_NAMES
+                and self._compact_tool_group is not None
+            ):
+                self._finish_compact_tool(
+                    event.tool_name, summary, is_error=event.result.is_error
+                )
                 return
             self._flush_compact_tool_group()
             self._append(f"  {summary}\n")
+        elif isinstance(event, RoundCompleteEvent):
+            self._finish_reasoning_stream()
+            self._start_waiting_indicator("Waiting for model")
         elif isinstance(event, AgentErrorEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             self._streaming = False
+            self._active_tool_name = None
             self._ensure_newline()
             self._flush_compact_tool_group()
-            label = "Current turn stopped" if event.kind == "fatal_tool" else "Error"
+            label = (
+                "Current turn stopped"
+                if event.kind == "fatal_tool"
+                else "Interrupted"
+                if event.kind == "user_interrupted"
+                else "Error"
+            )
             self._append(f"{label}: {event.message}\n")
         elif isinstance(event, TurnEndEvent):
             self._stop_waiting_indicator(clear=True)
+            self._finish_reasoning_stream()
             self._streaming = False
+            self._active_tool_name = None
             self._ensure_newline()
             self._flush_compact_tool_group()
             if not self._todo_has_active_work():
@@ -2122,10 +2567,16 @@ class SpiceTUI:
                 self._app.invalidate()
 
     def _todo_has_active_work(self) -> bool:
-        return any(str(item.get("status") or "pending") in {"pending", "in_progress"} for item in self._todo_items)
+        return any(
+            str(item.get("status") or "pending") in {"pending", "in_progress"}
+            for item in self._todo_items
+        )
 
     def _start_compact_tool(self, tool_name: str, start: str) -> None:
-        if self._compact_tool_group is not None and self._compact_tool_group.tool_name != tool_name:
+        if (
+            self._compact_tool_group is not None
+            and self._compact_tool_group.tool_name != tool_name
+        ):
             self._flush_compact_tool_group()
         if self._compact_tool_group is None:
             self._compact_tool_group = CompactToolGroup(tool_name=tool_name)
@@ -2133,8 +2584,13 @@ class SpiceTUI:
         self._compact_tool_group.last_start = start
         self._compact_tool_group.last_end = ""
 
-    def _finish_compact_tool(self, tool_name: str, summary: str, *, is_error: bool) -> None:
-        if self._compact_tool_group is None or self._compact_tool_group.tool_name != tool_name:
+    def _finish_compact_tool(
+        self, tool_name: str, summary: str, *, is_error: bool
+    ) -> None:
+        if (
+            self._compact_tool_group is None
+            or self._compact_tool_group.tool_name != tool_name
+        ):
             self._flush_compact_tool_group()
             self._compact_tool_group = CompactToolGroup(tool_name=tool_name, count=1)
         self._compact_tool_group.last_end = summary
@@ -2176,13 +2632,29 @@ class SpiceTUI:
 
         self._refresh_completer()
         self._append(f"Session: {self._agent_session.session_label}\n")
+        if self._trace:
+            from spice.agent.trace import attach_trace_writer
+
+            self._trace_writer, trace_path = attach_trace_writer(
+                self._agent_session, path=self._trace_file
+            )
+            self._append(f"Trace: {trace_path}\n")
         self._append(f"Model: {self._agent_session.runtime_model_label}\n")
         if self._agent_session.extensions.errors:
             for err in self._agent_session.extensions.errors:
                 self._append(f"Extension load failed: {err}\n")
         # self._append("Type your message and press Enter. Ctrl+C to quit.\n")
 
-        await self._app.run_async()
+        try:
+            await self._app.run_async()
+        finally:
+            if self._agent_session is not None:
+                await self._agent_session.aclose()
+
+    def _bind_trace_session(self) -> None:
+        trace_writer = getattr(self, "_trace_writer", None)
+        if trace_writer is not None and self._agent_session is not None:
+            trace_writer.bind(self._agent_session)
 
 
 def run_tui(
@@ -2191,6 +2663,8 @@ def run_tui(
     model: str | None = None,
     session_id: str | None = None,
     continue_session: bool = False,
+    trace: bool = False,
+    trace_file: Path | None = None,
 ) -> None:
     """Synchronous entry point used by the Typer command."""
     from spice.cli.terminal import preserve_cursor_blink
@@ -2201,5 +2675,7 @@ def run_tui(
         model=model,
         session_id=session_id,
         continue_session=continue_session,
+        trace=trace,
+        trace_file=trace_file,
     )
     asyncio.run(tui.run())

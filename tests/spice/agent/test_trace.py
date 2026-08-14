@@ -12,6 +12,7 @@ from spice.agent.events import (
     AssistantMessageEvent,
     ModelFallbackEvent,
     ModelRetryEvent,
+    ReasoningDeltaEvent,
     RoundCompleteEvent,
     TextDeltaEvent,
     ToolExecutionEndEvent,
@@ -33,7 +34,9 @@ class FakeSession:
         self.config = SpiceConfig(provider="openai", model="gpt-5.1", temperature=0.2)
         self.subagents_enabled = True
         self.messages = [Message(role="system", content="system prompt")]
-        self.session = type("SessionInfo", (), {"id": session_id})() if session_id else None
+        self.session = (
+            type("SessionInfo", (), {"id": session_id})() if session_id else None
+        )
         self.session_label = session_id or "new"
         self._listeners = []
 
@@ -49,7 +52,9 @@ class FakeSession:
             listener(event)
 
 
-def test_attach_trace_writer_uses_unique_timestamped_path(monkeypatch, tmp_path: Path) -> None:
+def test_attach_trace_writer_uses_unique_timestamped_path(
+    monkeypatch, tmp_path: Path
+) -> None:
     import spice.agent.trace as trace_module
 
     monkeypatch.setattr(trace_module, "TRACE_DIR", tmp_path)
@@ -76,12 +81,18 @@ def test_trace_writer_can_follow_replacement_session(tmp_path: Path) -> None:
     second.emit(AgentStartEvent("second"))
 
     data = json.loads(path.read_text(encoding="utf-8"))
-    starts = [event["session_id"] for event in data["events"] if event["type"] == "agent_start"]
+    starts = [
+        event["session_id"]
+        for event in data["events"]
+        if event["type"] == "agent_start"
+    ]
     assert starts == ["first", "second"]
     assert data["session_id"] == "second"
 
 
-def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(tmp_path: Path) -> None:
+def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(
+    tmp_path: Path,
+) -> None:
     session = FakeSession(tmp_path)
     path = tmp_path / "run.trace.json"
     writer = RunTraceWriter(path, session)
@@ -89,8 +100,17 @@ def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(tmp
     writer.record(AgentStartEvent(session_id="session-1"))
     writer.record(TextDeltaEvent("hello "))
     writer.record(TextDeltaEvent("world"))
+    writer.record(ReasoningDeltaEvent("sensitive intermediate reasoning"))
     call = ToolCall(id="tc1", name="read_file", arguments={"path": "README.md"})
-    session.messages.append(Message(role="assistant", content="", tool_calls=[call], provider="openai", model="gpt-5.1"))
+    session.messages.append(
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[call],
+            provider="openai",
+            model="gpt-5.1",
+        )
+    )
     usage = ModelUsageRecord(
         provider="openai",
         model="gpt-5.1",
@@ -100,10 +120,32 @@ def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(tmp
     )
     writer.record(AssistantMessageEvent(text="", tool_calls=[call], usage=usage))
     writer.record(ModelRetryEvent("openai", "gpt-5.1", 1, 2, 3, 0.5, "temporary"))
-    writer.record(ModelFallbackEvent("primary", "openai", "gpt-5.1", "backup", "anthropic", "claude", "server", 0, 1))
-    writer.record(ToolExecutionStartEvent(tool_call_id="tc1", tool_name="read_file", args={"path": "README.md"}))
-    session.messages.append(Message(role="tool", content="# README", tool_call_id="tc1", name="read_file"))
-    writer.record(ToolExecutionEndEvent(tool_call_id="tc1", tool_name="read_file", result=tool_result("# README")))
+    writer.record(
+        ModelFallbackEvent(
+            "primary",
+            "openai",
+            "gpt-5.1",
+            "backup",
+            "anthropic",
+            "claude",
+            "server",
+            0,
+            1,
+        )
+    )
+    writer.record(
+        ToolExecutionStartEvent(
+            tool_call_id="tc1", tool_name="read_file", args={"path": "README.md"}
+        )
+    )
+    session.messages.append(
+        Message(role="tool", content="# README", tool_call_id="tc1", name="read_file")
+    )
+    writer.record(
+        ToolExecutionEndEvent(
+            tool_call_id="tc1", tool_name="read_file", result=tool_result("# README")
+        )
+    )
     writer.record(RoundCompleteEvent(1))
     writer.record(TurnEndEvent(text="done", stop_reason="stop"))
     writer.record(AgentEndEvent(session_id="session-1"))
@@ -115,25 +157,42 @@ def test_run_trace_writer_records_runtime_snapshot_without_text_delta_events(tmp
     assert data["kind"] == "agent_trajectory"
     assert data["source"] == "runtime"
     assert data["session_id"] == "session-1"
-    assert data["model"] == {"provider": "openai", "id": "gpt-5.1", "display_name": "gpt-5.1"}
+    assert data["model"] == {
+        "provider": "openai",
+        "id": "gpt-5.1",
+        "display_name": "gpt-5.1",
+    }
     assert data["runtime"]["active_tools"] == ["read_file", "bash"]
-    assert [message["role"] for message in data["messages"]] == ["system", "assistant", "tool"]
+    assert [message["role"] for message in data["messages"]] == [
+        "system",
+        "assistant",
+        "tool",
+    ]
     assert "text_delta" not in {event["type"] for event in data["events"]}
     assert data["summary"]["status"] == "completed"
     assert data["summary"]["stop_reason"] == "stop"
     assert data["summary"]["tool_calls"] == 1
     assert data["summary"]["text_delta_events"] == 2
     assert data["summary"]["text_delta_chars"] == len("hello world")
+    assert data["summary"]["reasoning_delta_events"] == 1
+    assert data["summary"]["reasoning_delta_chars"] == len(
+        "sensitive intermediate reasoning"
+    )
+    assert "sensitive intermediate reasoning" not in path.read_text(encoding="utf-8")
     assert data["summary"]["usage"]["model_calls"] == 1
     assert data["summary"]["usage"]["input_tokens"] == 100
-    assistant_event = next(event for event in data["events"] if event["type"] == "assistant_message")
+    assistant_event = next(
+        event for event in data["events"] if event["type"] == "assistant_message"
+    )
     assert assistant_event["usage"]["estimated_cost_usd"] == "0.001"
     assert "model_retry" in {event["type"] for event in data["events"]}
     assert "model_fallback" in {event["type"] for event in data["events"]}
     assert "round_complete" in {event["type"] for event in data["events"]}
 
 
-def test_run_command_trace_file_wires_runtime_writer(monkeypatch, tmp_path: Path) -> None:
+def test_run_command_trace_file_wires_runtime_writer(
+    monkeypatch, tmp_path: Path
+) -> None:
     trace_path = tmp_path / "cli.trace.json"
     fake_session = FakeSession(tmp_path, session_id=None)
 
@@ -174,13 +233,18 @@ def test_user_interruption_has_distinct_trace_status(tmp_path: Path) -> None:
     assert writer.snapshot()["summary"]["status"] == "completed"
 
 
-def test_trace_redacts_secrets_drops_full_output_and_uses_private_permissions(tmp_path: Path) -> None:
+def test_trace_redacts_secrets_drops_full_output_and_uses_private_permissions(
+    tmp_path: Path,
+) -> None:
     session = FakeSession(tmp_path)
     session.messages.append(
         Message(
             role="tool",
             content="Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
-            metadata={"_full_tool_output": "private full output", "tool_result": {"api_key": "secret-value"}},
+            metadata={
+                "_full_tool_output": "private full output",
+                "tool_result": {"api_key": "secret-value"},
+            },
         )
     )
     path = tmp_path / "private.trace.json"

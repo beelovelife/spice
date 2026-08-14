@@ -8,7 +8,7 @@ from typing import Any
 
 from spice.agent.long_task import LongTaskState, _new_task_id, _now, _todo_summary
 from spice.llm.config import CONFIG_DIR
-from spice.storage.sqlite import connect_sqlite, init_sqlite_database
+from spice.storage.sqlite import init_sqlite_database, open_sqlite
 
 DEFAULT_SQLITE_PATH = CONFIG_DIR / "spice.db"
 
@@ -41,7 +41,7 @@ class SqliteLongTaskStore:
         return state
 
     def load_state(self, task_id: str) -> LongTaskState:
-        with connect_sqlite(self.db_path) as conn:
+        with open_sqlite(self.db_path) as conn:
             row = conn.execute("select data_json from long_tasks where task_id = ?", (task_id,)).fetchone()
         if row is None:
             raise ValueError(f"Long task not found: {task_id}")
@@ -53,7 +53,7 @@ class SqliteLongTaskStore:
     def save_state(self, state: LongTaskState) -> None:
         state.updated_at = state.updated_at or _now()
         payload = state.to_dict()
-        with connect_sqlite(self.db_path) as conn:
+        with open_sqlite(self.db_path) as conn:
             conn.execute(
                 """
                 insert into long_tasks (
@@ -99,7 +99,7 @@ class SqliteLongTaskStore:
             "lastStopReason": state.last_stop_reason,
             "updatedAt": _now(),
         }
-        with connect_sqlite(self.db_path) as conn:
+        with open_sqlite(self.db_path) as conn:
             conn.execute(
                 """
                 insert into long_task_checkpoints (task_id, updated_at, data_json)
@@ -118,7 +118,7 @@ class SqliteLongTaskStore:
             "type": event_type,
             "data": data or {},
         }
-        with connect_sqlite(self.db_path) as conn:
+        with open_sqlite(self.db_path) as conn:
             conn.execute(
                 """
                 insert into long_task_events (task_id, timestamp, type, data_json)
@@ -128,7 +128,7 @@ class SqliteLongTaskStore:
             )
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        with connect_sqlite(self.db_path) as conn:
+        with open_sqlite(self.db_path) as conn:
             row = conn.execute("select data_json from long_task_checkpoints where task_id = ?", (task_id,)).fetchone()
         if row is None:
             return None
@@ -136,7 +136,7 @@ class SqliteLongTaskStore:
         return data if isinstance(data, dict) else None
 
     def read_events(self, task_id: str) -> list[dict[str, Any]]:
-        with connect_sqlite(self.db_path) as conn:
+        with open_sqlite(self.db_path) as conn:
             rows = conn.execute(
                 "select data_json from long_task_events where task_id = ? order by id",
                 (task_id,),

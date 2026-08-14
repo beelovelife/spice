@@ -24,6 +24,7 @@ WELCOME_QUOTES: list[WelcomeQuote] = [
     ("Survival is the ability to swim in strange water.", "生存，就是在陌生水域中游泳的能力。"),
     ("The people who can destroy a thing, they control it.", "能毁灭某物的人，才是真正控制它的人。"),
     ("Without change, something sleeps inside us, and seldom awakens.", "没有变化，内心某些东西便沉睡不醒。"),
+    ("We must join it. We must flow with it.", "我们必须顺势而行。"),
     ("This is only the beginning.", "这仅仅是个开始。"),
 ]
 

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
-from spice.interactive.confirm import ConfirmPolicy, is_file_edit_tool, is_read_only_bash_command
+from spice.interactive.confirm import (
+    ConfirmPolicy,
+    build_tool_confirm_request,
+    is_file_edit_tool,
+    is_read_only_bash_command,
+)
 from spice.interactive.types import ChoiceRequest, ConfirmRequest
 
 
@@ -34,10 +39,34 @@ def test_file_edit_session_allow_skips_second_prompt() -> None:
     assert policy.allow_file_edits is True
 
 
+def test_allow_all_tools_skips_every_later_confirmation() -> None:
+    policy = ConfirmPolicy()
+    port = FakePort(decision="allow_all_tools")
+
+    assert asyncio.run(policy.confirm("bash", {"command": "make build"}, port)) is True
+    assert asyncio.run(policy.confirm("write_file", {"path": "a.py"}, port)) is True
+    assert asyncio.run(policy.confirm("dangerous_extension_tool", {}, port)) is True
+    assert port.calls == 1
+    assert policy.allow_all_tools is True
+
+
+def test_all_tool_choice_is_available_for_every_confirmation() -> None:
+    request = build_tool_confirm_request("bash", {"command": "make build"})
+
+    assert [choice.id for choice in request.choices] == [
+        "allow",
+        "allow_all_tools",
+        "deny",
+    ]
+    assert request.choices[1].detail == "no more permission prompts"
+
+
 def test_new_policy_does_not_inherit_prior_session_flags() -> None:
     first = ConfirmPolicy()
     first.allow_file_edits = True
     second = ConfirmPolicy()
+    first.allow_all_tools = True
+    assert second.allow_all_tools is False
     assert second.allow_file_edits is False
     assert is_file_edit_tool("edit_file")
     assert second.precheck("edit_file", {"path": "x.py"}) is None

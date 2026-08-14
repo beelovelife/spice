@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from spice.agent.logging_config import get_logger
@@ -50,6 +50,39 @@ class SessionContext:
     messages: list[Message]
     entries: list[SessionEntry]
     leaf_id: str | None
+
+
+class SessionStoreProtocol(Protocol):
+    base_dir: Path
+
+    @property
+    def base_root(self) -> Path: ...
+
+    def create(self, *, cwd: Path, provider: str, model: str, parent_session_id: str | None = None) -> SessionInfo: ...
+    def path_for(self, session_id: str) -> Path: ...
+    def info(self, session_id: str) -> SessionInfo: ...
+    def list(self, *, cwd: Path | None = None, limit: int | None = None, include_empty: bool = False) -> list[SessionInfo]: ...
+    def latest(self, *, cwd: Path | None = None) -> SessionInfo: ...
+    def resolve(self, session_id: str, *, cwd: Path | None = None) -> SessionInfo: ...
+    def entries(self, session_id: str) -> list[SessionEntry]: ...
+    def path_entries(self, session_id: str, leaf_id: str | None = None) -> list[SessionEntry]: ...
+    def build_context(self, session_id: str, leaf_id: str | None = None) -> SessionContext: ...
+    def load_messages(self, session_id: str, leaf_id: str | None = None) -> list[Message]: ...
+    def append_message(self, session_id: str, message: Message, parent_id: str | None = None) -> str: ...
+    def append_custom(self, session_id: str, data: dict[str, Any], parent_id: str | None = None) -> str: ...
+    def append_model_change(self, session_id: str, *, provider: str, model: str, parent_id: str | None = None) -> str: ...
+    def append_compaction(
+        self,
+        session_id: str,
+        *,
+        summary: str,
+        first_kept_entry_id: str,
+        tokens_before: int,
+        details: dict[str, Any] | None = None,
+    ) -> str: ...
+    def set_leaf(self, session_id: str, entry_id: str) -> str: ...
+    def reset(self, session_id: str) -> SessionInfo: ...
+    def delete(self, session_id: str) -> None: ...
 
 
 def workspace_key(cwd: Path) -> str:
@@ -96,6 +129,34 @@ def message_from_dict(data: dict[str, Any]) -> Message:
         model=data.get("model"),
         metadata=dict(data.get("metadata") or {}),
     )
+
+
+def messages_from_path_entries(entries: list[SessionEntry]) -> list[Message]:
+    """Rebuild the active message list from ordered path entries.
+
+    A compaction entry restarts the context with its summary plus every kept
+    message from first_kept_entry_id up to (but not including) the compaction
+    entry itself. Older sessions where the compaction entry branched directly
+    off first_kept_entry_id degrade to keeping that single message, matching
+    their stored tree shape.
+    """
+    messages: list[Message] = []
+    for index, entry in enumerate(entries):
+        if entry.type == "compaction":
+            summary = str(entry.data.get("summary") or "")
+            first_kept_id = entry.data.get("first_kept_entry_id")
+            kept_messages: list[Message] = []
+            collecting = False
+            for candidate in entries[:index]:
+                if candidate.id == first_kept_id:
+                    collecting = True
+                if collecting and candidate.type == "message":
+                    kept_messages.append(message_from_dict(candidate.data.get("message") or {}))
+            messages = [Message(role="system", content=f"Previous conversation summary:\n{summary}"), *kept_messages]
+            continue
+        if entry.type == "message":
+            messages.append(message_from_dict(entry.data.get("message") or {}))
+    return _stub_older_tool_results(messages)
 
 
 class SessionStore:
@@ -258,24 +319,7 @@ class SessionStore:
 
     def build_context(self, session_id: str, leaf_id: str | None = None) -> SessionContext:
         entries = self.path_entries(session_id, leaf_id=leaf_id)
-        messages: list[Message] = []
-        first_kept_id: str | None = None
-        for entry in entries:
-            if entry.type == "compaction":
-                summary = str(entry.data.get("summary") or "")
-                first_kept_id = entry.data.get("first_kept_entry_id")
-                kept_messages = []
-                for candidate in entries:
-                    if candidate.id == first_kept_id and candidate.type == "message":
-                        kept_messages.append(message_from_dict(candidate.data.get("message") or {}))
-                        break
-                messages = [Message(role="system", content=f"Previous conversation summary:\n{summary}"), *kept_messages]
-                continue
-            if first_kept_id and entry.id != first_kept_id and not messages:
-                continue
-            if entry.type == "message":
-                messages.append(message_from_dict(entry.data.get("message") or {}))
-        messages = _stub_older_tool_results(messages)
+        messages = messages_from_path_entries(entries)
         return SessionContext(messages=messages, entries=entries, leaf_id=entries[-1].id if entries else None)
 
     def load_messages(self, session_id: str, leaf_id: str | None = None) -> list[Message]:
@@ -299,6 +343,9 @@ class SessionStore:
         tokens_before: int,
         details: dict[str, Any] | None = None,
     ) -> str:
+        # Append at the current leaf so kept messages between first_kept_entry_id
+        # and the compaction entry stay on the active path. Branching from
+        # first_kept_entry_id would orphan every kept message after the first one.
         return self._append_entry(
             session_id,
             "compaction",
@@ -308,7 +355,6 @@ class SessionStore:
                 "tokens_before": tokens_before,
                 "details": details or {},
             },
-            parent_id=first_kept_entry_id,
         )
 
     def set_leaf(self, session_id: str, entry_id: str) -> str:

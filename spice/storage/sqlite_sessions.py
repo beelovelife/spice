@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,16 +18,41 @@ from spice.agent.sessions import (
     _current_leaf,
     _current_model,
     _now,
-    _stub_older_tool_results,
-    message_from_dict,
     message_to_dict,
+    messages_from_path_entries,
     workspace_key,
 )
 from spice.llm.config import CONFIG_DIR
 from spice.llm.messages import Message
-from spice.storage.sqlite import connect_sqlite, init_sqlite_database
+from spice.storage.sqlite import init_sqlite_database, open_sqlite
 
 DEFAULT_SQLITE_PATH = CONFIG_DIR / "spice.db"
+
+# Walks the active path leaf -> root in SQL so listing sessions does not load
+# every entry. data_json is only shipped for the types info() actually reads.
+_ACTIVE_PATH_QUERY = """
+with recursive active_path(id, parent_id, type, timestamp, data_json) as (
+    select id, parent_id, type, timestamp, data_json
+    from session_entries
+    where session_id = :session_id and id = :leaf_id
+    union
+    select e.id, e.parent_id, e.type, e.timestamp, e.data_json
+    from session_entries e
+    join active_path p on e.id = p.parent_id
+    where e.session_id = :session_id
+)
+select id, parent_id, type, timestamp,
+       case when type in ('message', 'model_change') then data_json end as data_json
+from active_path
+"""
+
+
+def _entry_data(raw: Any) -> dict[str, Any]:
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        data = {}
+    return data if isinstance(data, dict) else {}
 
 
 class SqliteSessionStore:
@@ -72,8 +98,9 @@ class SqliteSessionStore:
         return self.db_path
 
     def info(self, session_id: str) -> SessionInfo:
-        header, entries = self._read_session(session_id)
-        return self._info_from_entries(header, entries, fallback_id=session_id)
+        with self._connect() as conn:
+            header = self._header_for(session_id, conn=conn)
+            return self._info_for_header(header, conn=conn)
 
     def list(self, *, cwd: Path | None = None, limit: int | None = None, include_empty: bool = False) -> list[SessionInfo]:
         query = "select * from sessions"
@@ -90,8 +117,7 @@ class SqliteSessionStore:
         with self._connect() as conn:
             for row in conn.execute(query, params).fetchall():
                 header = self._header_from_row(row)
-                entries = self._entries_for(row["id"], conn=conn)
-                info = self._info_from_entries(header, entries, fallback_id=row["id"])
+                info = self._info_for_header(header, conn=conn)
                 if info.message_count == 0 and not include_empty:
                     continue
                 rows.append(info)
@@ -135,24 +161,7 @@ class SqliteSessionStore:
 
     def build_context(self, session_id: str, leaf_id: str | None = None) -> SessionContext:
         entries = self.path_entries(session_id, leaf_id=leaf_id)
-        messages: list[Message] = []
-        first_kept_id: str | None = None
-        for entry in entries:
-            if entry.type == "compaction":
-                summary = str(entry.data.get("summary") or "")
-                first_kept_id = entry.data.get("first_kept_entry_id")
-                kept_messages = []
-                for candidate in entries:
-                    if candidate.id == first_kept_id and candidate.type == "message":
-                        kept_messages.append(message_from_dict(candidate.data.get("message") or {}))
-                        break
-                messages = [Message(role="system", content=f"Previous conversation summary:\n{summary}"), *kept_messages]
-                continue
-            if first_kept_id and entry.id != first_kept_id and not messages:
-                continue
-            if entry.type == "message":
-                messages.append(message_from_dict(entry.data.get("message") or {}))
-        messages = _stub_older_tool_results(messages)
+        messages = messages_from_path_entries(entries)
         return SessionContext(messages=messages, entries=entries, leaf_id=entries[-1].id if entries else None)
 
     def load_messages(self, session_id: str, leaf_id: str | None = None) -> list[Message]:
@@ -176,6 +185,9 @@ class SqliteSessionStore:
         tokens_before: int,
         details: dict[str, Any] | None = None,
     ) -> str:
+        # Append at the current leaf so kept messages between first_kept_entry_id
+        # and the compaction entry stay on the active path. Branching from
+        # first_kept_entry_id would orphan every kept message after the first one.
         return self._append_entry(
             session_id,
             "compaction",
@@ -185,11 +197,15 @@ class SqliteSessionStore:
                 "tokens_before": tokens_before,
                 "details": details or {},
             },
-            parent_id=first_kept_entry_id,
         )
 
     def set_leaf(self, session_id: str, entry_id: str) -> str:
-        if entry_id not in {entry.id for entry in self.entries(session_id)}:
+        with self._connect() as conn:
+            row = conn.execute(
+                "select 1 from session_entries where session_id = ? and id = ?",
+                (session_id, entry_id),
+            ).fetchone()
+        if row is None:
             raise ValueError(f"Entry not found: {entry_id}")
         return self._append_entry(session_id, "leaf", {"leaf_id": entry_id}, parent_id=entry_id)
 
@@ -214,9 +230,10 @@ class SqliteSessionStore:
             raise ValueError(f"Invalid session entry type: {entry_type}")
         with self._connect() as conn:
             header = self._header_for(session_id, conn=conn)
-            entries = self._entries_for(session_id, conn=conn)
             if parent_id is None:
-                parent_id = _current_leaf(header, entries)
+                # sessions.leaf_id is maintained on every append; only legacy rows
+                # (or empty sessions) need the full-scan fallback.
+                parent_id = header.get("leaf_id") or _current_leaf(header, self._entries_for(session_id, conn=conn))
             entry_id = uuid4().hex[:12]
             timestamp = _now()
             ordinal = self._next_ordinal(session_id, conn=conn)
@@ -234,6 +251,64 @@ class SqliteSessionStore:
                 (timestamp, leaf_id, session_id),
             )
             return entry_id
+
+    def _info_for_header(self, header: dict[str, Any], *, conn: sqlite3.Connection) -> SessionInfo:
+        session_id = str(header.get("id") or "")
+        leaf_id = header.get("leaf_id")
+        if not leaf_id:
+            # Legacy sessions may predate the maintained leaf_id column.
+            entries = self._entries_for(session_id, conn=conn)
+            return self._info_from_entries(header, entries, fallback_id=session_id)
+        path_rows = conn.execute(_ACTIVE_PATH_QUERY, {"session_id": session_id, "leaf_id": leaf_id}).fetchall()
+        if not path_rows:
+            entries = self._entries_for(session_id, conn=conn)
+            return self._info_from_entries(header, entries, fallback_id=session_id)
+
+        by_id = {str(row["id"]): row for row in path_rows}
+        ordered: list[sqlite3.Row] = []
+        current: str | None = str(leaf_id)
+        seen: set[str] = set()
+        while current and current in by_id and current not in seen:
+            seen.add(current)
+            row = by_id[current]
+            ordered.append(row)
+            current = row["parent_id"]
+        ordered.reverse()
+
+        message_rows = [row for row in ordered if str(row["type"]) == "message"]
+        preview = ""
+        for row in reversed(message_rows):
+            message = _entry_data(row["data_json"]).get("message") or {}
+            content = str(message.get("content") or "").strip()
+            if content:
+                preview = content.splitlines()[0][:120]
+                break
+        provider = str(header.get("provider") or "")
+        model = str(header.get("model") or "")
+        for row in reversed(ordered):
+            if str(row["type"]) == "model_change":
+                data = _entry_data(row["data_json"])
+                provider = str(data.get("provider") or provider)
+                model = str(data.get("model") or model)
+                break
+        last = conn.execute(
+            "select timestamp from session_entries where session_id = ? order by ordinal desc limit 1",
+            (session_id,),
+        ).fetchone()
+        updated_at = str(last["timestamp"]) if last else str(header.get("updated_at") or header.get("created_at") or "")
+        return SessionInfo(
+            id=session_id,
+            path=self.db_path,
+            cwd=str(header.get("cwd") or ""),
+            provider=provider,
+            model=model,
+            created_at=str(header.get("created_at") or ""),
+            updated_at=updated_at,
+            preview=preview,
+            leaf_id=str(leaf_id),
+            message_count=len(message_rows),
+            parent_session_id=header.get("parent_session_id"),
+        )
 
     def _info_from_entries(self, header: dict[str, Any], entries: list[SessionEntry], *, fallback_id: str) -> SessionInfo:
         leaf_id = _current_leaf(header, entries)
@@ -321,12 +396,7 @@ class SqliteSessionStore:
             parent_id = row["parent_id"]
             if parent_id is None and entry_type == "message" and previous_id is not None:
                 parent_id = previous_id
-            try:
-                data = json.loads(row["data_json"])
-            except json.JSONDecodeError:
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
+            data = _entry_data(row["data_json"])
             entries.append(
                 SessionEntry(
                     id=str(row["id"]),
@@ -344,8 +414,8 @@ class SqliteSessionStore:
         row = conn.execute("select coalesce(max(ordinal), 0) + 1 as next_ordinal from session_entries where session_id = ?", (session_id,)).fetchone()
         return int(row["next_ordinal"])
 
-    def _connect(self) -> sqlite3.Connection:
-        return connect_sqlite(self.db_path)
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
+        return open_sqlite(self.db_path)
 
     def _init_db(self) -> None:
         init_sqlite_database(self.db_path)

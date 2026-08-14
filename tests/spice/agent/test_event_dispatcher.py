@@ -3,7 +3,12 @@ from __future__ import annotations
 import asyncio
 
 from spice.agent.event_dispatcher import AgentEventDispatcher
-from spice.agent.events import RoundCompleteEvent, ToolExecutionEndEvent, TurnStartEvent
+from spice.agent.events import (
+    ReasoningDeltaEvent,
+    RoundCompleteEvent,
+    ToolExecutionEndEvent,
+    TurnStartEvent,
+)
 from spice.extensions.manager import ExtensionEvent
 from spice.tools.base import tool_result
 
@@ -21,7 +26,9 @@ def test_agent_event_dispatcher_fans_out_and_unsubscribes() -> None:
     async def run():
         dispatcher = AgentEventDispatcher()
         seen = []
-        unsubscribe = dispatcher.subscribe(lambda event: seen.append(type(event).__name__))
+        unsubscribe = dispatcher.subscribe(
+            lambda event: seen.append(type(event).__name__)
+        )
 
         await dispatcher.dispatch(TurnStartEvent(prompt="hello"))
         unsubscribe()
@@ -58,7 +65,11 @@ def test_agent_event_dispatcher_forwards_extension_observer_events() -> None:
         extensions = FakeExtensions()
         dispatcher = AgentEventDispatcher(extensions)
         await dispatcher.dispatch(TurnStartEvent(prompt="hello"))
-        await dispatcher.dispatch(ToolExecutionEndEvent(tool_call_id="tc1", tool_name="read_file", result=tool_result("ok")))
+        await dispatcher.dispatch(
+            ToolExecutionEndEvent(
+                tool_call_id="tc1", tool_name="read_file", result=tool_result("ok")
+            )
+        )
         return extensions.seen
 
     seen = asyncio.run(run())
@@ -78,3 +89,15 @@ def test_round_complete_is_forwarded_to_extensions() -> None:
         return extensions.seen
 
     assert asyncio.run(run()) == [("round_complete", {"round_index": 2})]
+
+
+def test_reasoning_delta_is_forwarded_to_extensions() -> None:
+    async def run():
+        extensions = FakeExtensions()
+        dispatcher = AgentEventDispatcher(extensions)
+        await dispatcher.dispatch(ReasoningDeltaEvent("checking", kind="summary"))
+        return extensions.seen
+
+    assert asyncio.run(run()) == [
+        ("reasoning_delta", {"text": "checking", "kind": "summary"})
+    ]

@@ -61,14 +61,19 @@ class ModelRegistryTests(unittest.TestCase):
             self.assertEqual(flash.temperature, 0.1)
             self.assertEqual(pro.output_tokens, 60000)
 
-    def test_deepseek_provider_uses_openai_compatible_base_url(self) -> None:
-        registry = ModelRegistry()
-        model = registry.find("deepseek", "deepseek-v4-pro")
-        provider = get_provider("deepseek", protocol=model.protocol, model=model)
+    def test_deepseek_provider_uses_responses_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory) / "missing-settings.json")
+            model = registry.find("deepseek", "deepseek-v4-pro")
+            provider = get_provider("deepseek", protocol=model.protocol, model=model)
 
-        self.assertIsNotNone(provider)
-        self.assertEqual(getattr(provider, "default_base_url", None), "https://api.deepseek.com")
-        self.assertFalse(getattr(provider, "use_responses", False))
+            self.assertIsNotNone(provider)
+            self.assertEqual(model.protocol, "openai-responses")
+            self.assertEqual(
+                getattr(provider, "default_base_url", None),
+                "https://api.deepseek.com",
+            )
+            self.assertTrue(getattr(provider, "use_responses", False))
 
     def test_custom_anthropic_profile_uses_configured_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -96,7 +101,10 @@ class ModelRegistryTests(unittest.TestCase):
 
             self.assertIsNotNone(provider)
             self.assertEqual(model.base_url, "https://anthropic-proxy.example.com")
-            self.assertEqual(getattr(provider, "default_base_url", None), "https://anthropic-proxy.example.com")
+            self.assertEqual(
+                getattr(provider, "default_base_url", None),
+                "https://anthropic-proxy.example.com",
+            )
 
     def test_official_openai_provider_uses_responses_api(self) -> None:
         registry = ModelRegistry()
@@ -104,7 +112,38 @@ class ModelRegistryTests(unittest.TestCase):
         provider = get_provider("openai", protocol=model.protocol, model=model)
 
         self.assertIsNotNone(provider)
+        self.assertEqual(model.protocol, "openai-responses")
         self.assertTrue(getattr(provider, "use_responses", False))
+
+    def test_custom_profile_can_explicitly_use_responses_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "models": {
+                            "responses-proxy": {
+                                "provider": "custom",
+                                "model": "reasoning-model",
+                                "baseUrl": "https://proxy.example.com/v1",
+                                "protocol": "openai-responses",
+                                "supportsReasoning": True,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            model = ModelRegistry(path).find(None, "responses-proxy")
+            provider = get_provider("custom", protocol=model.protocol, model=model)
+
+            self.assertTrue(model.supports_reasoning)
+            self.assertTrue(getattr(provider, "use_responses", False))
+            self.assertEqual(
+                getattr(provider, "default_base_url", None),
+                "https://proxy.example.com/v1",
+            )
 
     def test_custom_openai_compatible_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -130,12 +169,24 @@ class ModelRegistryTests(unittest.TestCase):
 
             registry = ModelRegistry(path)
             model = registry.find(None, "local-qwen")
-            provider = get_provider("local-openai", protocol=model.protocol, model=model)
+            provider = get_provider(
+                "local-openai", protocol=model.protocol, model=model
+            )
 
             self.assertEqual(model.id, "qwen-coder")
             self.assertEqual(model.base_url, "http://localhost:1234/v1")
-            self.assertEqual(getattr(provider, "default_base_url", None), "http://localhost:1234/v1")
+            self.assertEqual(
+                getattr(provider, "default_base_url", None), "http://localhost:1234/v1"
+            )
             self.assertFalse(getattr(provider, "use_responses", False))
+
+    def test_openai_completions_protocol_is_not_silently_upgraded(self) -> None:
+        model = ModelRegistry().find("openai", "gpt-5.1")
+        model.protocol = "openai-completions"
+
+        provider = get_provider("openai", protocol=model.protocol, model=model)
+
+        self.assertFalse(getattr(provider, "use_responses", False))
 
     def test_custom_profile_can_define_pricing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

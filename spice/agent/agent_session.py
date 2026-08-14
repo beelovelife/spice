@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -13,13 +14,16 @@ from spice.agent.events import (
     AgentErrorEvent,
     AgentEvent,
     AgentStartEvent,
+    RoundCompleteEvent,
     ToolExecutionEndEvent,
     TurnEndEvent,
 )
 from spice.agent.file_references import FileReferenceError, expand_file_references
 from spice.agent.logging_config import get_logger
-from spice.agent.long_task import LONG_TASK_REF_ENTRY, LONG_TASK_STATE_ENTRY, LongTaskRef, LongTaskState
+from spice.agent.hooks import CompactionCompleted, HookManager
+from spice.agent.long_task import LONG_TASK_REF_ENTRY, LONG_TASK_STATE_ENTRY, LongTaskRef, LongTaskState, LongTaskStore
 from spice.agent.long_task_tools import create_long_task_tools
+from spice.agent.memory import MemoryDistiller, MemoryHistoryHandler
 from spice.agent.subagent import SubagentManager
 from spice.agent.plan_state import (
     PLAN_STATE_ENTRY,
@@ -43,8 +47,8 @@ from spice.agent.compaction import (
 )
 from spice.agent.loop import run_turn
 from spice.agent.prompts import build_system_prompt
-from spice.agent.sessions import SessionInfo, SessionStore
-from spice.agent.tool_results import cleanup_tool_results, prepare_tool_message_for_session
+from spice.agent.sessions import SessionInfo, SessionStore, SessionStoreProtocol
+from spice.agent.tool_results import build_tool_result_metadata, cleanup_tool_results, prepare_tool_message_for_session
 from spice.extensions.manager import ExtensionManager
 from spice.llm.config import get_api_key, load_config
 from spice.llm.messages import Message
@@ -54,10 +58,11 @@ from spice.llm.routing import build_model_route
 from spice.llm.types import ModelRequestOptions
 from spice.sandbox.factory import create_environment, create_workspace_policy
 from spice.storage.factory import create_long_task_store, create_memory_store, create_session_store
-from spice.tools.base import ConfirmFn
+from spice.tools.base import ConfirmFn, tool_error
 from spice.tools.file_state import FileStateStore
 from spice.tools.todo import create_update_todo_tool
 from spice.tools.tool_registry import create_coding_tools, create_read_only_tools
+from spice.mcp.manager import McpManager
 
 logger = get_logger(__name__)
 LONG_TASK_TOOL_NAMES = {"complete_long_task"}
@@ -73,7 +78,7 @@ class AgentSession:
         confirm: ConfirmFn | None = None,
         session_id: str | None = None,
         continue_latest: bool = False,
-        session_store: SessionStore | None = None,
+        session_store: SessionStoreProtocol | None = None,
         extension_manager: ExtensionManager | None = None,
     ) -> None:
         self.cwd = (cwd or Path.cwd()).resolve()
@@ -97,12 +102,23 @@ class AgentSession:
         if extension_manager is None:
             self.extensions.load_default()
         self.event_dispatcher = AgentEventDispatcher(self.extensions)
+        self.hooks = HookManager()
         self.file_states = FileStateStore()
         self.confirm = confirm
-        self.memory_store = create_memory_store(self.config)
+        self.mcp = McpManager(cwd=self.cwd, confirm=self.confirm)
+        self._mcp_revision = -1
+        self._mcp_tool_names: set[str] = set()
+        self.memory_store = create_memory_store(self.config, workspace=self.cwd)
+        if self.config.memory_enabled:
+            self.hooks.register(CompactionCompleted, MemoryHistoryHandler(self.memory_store))
         self.memory_context = self.memory_store.context_snapshot() if self.config.memory_enabled else ""
         self.subagents_enabled = self.config.subagents_enabled
-        self.long_task_store = create_long_task_store(self.config, file_base_dir=self.session_store.base_dir.parent / "tasks")
+        task_dir = self.session_store.base_dir.parent / "tasks"
+        self.long_task_store = (
+            LongTaskStore(task_dir)
+            if session_store is not None and isinstance(self.session_store, SessionStore)
+            else create_long_task_store(self.config, file_base_dir=task_dir)
+        )
         self.plan_state = self._load_plan_state()
         self.todo_state = self._load_todo_state()
         self.long_task_state = self._load_long_task_state()
@@ -146,11 +162,18 @@ class AgentSession:
     def subscribe(self, listener: AgentSessionListener) -> Callable[[], None]:
         return self.event_dispatcher.subscribe(listener)
 
+    def set_confirm(self, confirm: ConfirmFn | None) -> None:
+        """Rebind confirmation consistently across session-owned runtimes."""
+        self.confirm = confirm
+        self.mcp.confirm = confirm
+        self.subagent_manager.confirm = confirm
+
     @property
     def listener_errors(self) -> list[str]:
         return self.event_dispatcher.listener_errors
 
     async def prompt(self, text: str) -> AsyncIterator[AgentEvent]:
+        await self._ensure_mcp_tools()
         text = await self.extensions.transform_input(text)
         user_text = text
         if self.plan_state.is_plan_mode:
@@ -181,6 +204,7 @@ class AgentSession:
                 yield error_event
                 return
         persisted_from = len(self.messages)
+        persisted_until = persisted_from
         start_event = AgentStartEvent(session_id=self.session_id)
         await self._dispatch_event(start_event)
         yield start_event
@@ -190,6 +214,7 @@ class AgentSession:
             self.plan_state.mode,
             len(self.messages),
         )
+        generator_closed = False
         try:
             turn_text = ""
             self._defer_custom_state = True
@@ -220,6 +245,9 @@ class AgentSession:
                         self._persist_long_task_state()
                 elif isinstance(event, ToolExecutionEndEvent) and event.tool_name == "memory" and not event.result.is_error:
                     self._refresh_memory_context()
+                if isinstance(event, (RoundCompleteEvent, TurnEndEvent)):
+                    self._persist_messages_from(persisted_until)
+                    persisted_until = len(self.messages)
                 await self._dispatch_event(event)
                 yield event
             if self.plan_state.is_plan_mode:
@@ -228,11 +256,25 @@ class AgentSession:
                 if steps:
                     self.plan_state.steps = steps
                 self._persist_plan_state()
+        except GeneratorExit:
+            generator_closed = True
+            raise
+        except asyncio.CancelledError:
+            self._append_interrupted_tool_results(persisted_from)
+            interrupted_event = AgentErrorEvent(
+                "Current model or tool execution was interrupted by the user. Completed side effects were not rolled back.",
+                kind="user_interrupted",
+            )
+            await self._dispatch_event(interrupted_event)
+            yield interrupted_event
+            turn_end = TurnEndEvent(text="", stop_reason="user_interrupted")
+            await self._dispatch_event(turn_end)
+            yield turn_end
         finally:
             self._defer_custom_state = False
             messages_persisted = False
             try:
-                parent_id = self._persist_messages_from(persisted_from)
+                parent_id = self._persist_messages_from(persisted_until)
                 messages_persisted = True
                 self._flush_custom_state(parent_id=parent_id)
             except Exception:
@@ -245,10 +287,40 @@ class AgentSession:
                     )
                     self._discard_deferred_custom_state()
                 raise
-            end_event = AgentEndEvent(session_id=self.session_id)
-            await self._dispatch_event(end_event)
-            yield end_event
+            if not generator_closed:
+                end_event = AgentEndEvent(session_id=self.session_id)
+                await self._dispatch_event(end_event)
+                yield end_event
             logger.info("session_prompt_end session_id=%s", self.session_id)
+
+    def _append_interrupted_tool_results(self, start_index: int) -> None:
+        completed = {
+            message.tool_call_id
+            for message in self.messages[start_index:]
+            if message.role == "tool" and message.tool_call_id
+        }
+        pending = [
+            call
+            for message in self.messages[start_index:]
+            if message.role == "assistant"
+            for call in message.tool_calls
+            if call.id not in completed
+        ]
+        for call in pending:
+            result = tool_error(
+                "Tool execution interrupted by user. It was not retried automatically; check the workspace for partial side effects.",
+                code="user_interrupted",
+            )
+            self.messages.append(
+                Message(
+                    role="tool",
+                    content=result.content,
+                    tool_call_id=call.id,
+                    name=call.name,
+                    is_error=True,
+                    metadata=build_tool_result_metadata(call.name, call.arguments, result),
+                )
+            )
 
     async def _dispatch_event(self, event: AgentEvent) -> None:
         await self.event_dispatcher.dispatch(event)
@@ -345,6 +417,39 @@ class AgentSession:
     def compaction_status(self, messages: list[Message] | None = None) -> CompactionCheck:
         return check_compaction_needed(messages or self.messages, self.model)
 
+    async def distill_current_memory(self, *, scope: Literal["all", "global", "project"] = "all") -> dict:
+        if not self.config.memory_enabled:
+            return {"success": False, "processed": 0, "message": "Long-term memory is disabled."}
+        allowed = {
+            "all": {"user", "memory", "project"},
+            "global": {"user", "memory"},
+            "project": {"project"},
+        }[scope]
+        chunks: list[str] = []
+        for message in self.messages:
+            if message.role == "system":
+                continue
+            label = message.role if not message.name else f"{message.role}:{message.name}"
+            if message.content:
+                chunks.append(f"[{label}]\n{message.content}")
+            if message.tool_calls:
+                calls = [{"name": call.name, "arguments": call.arguments} for call in message.tool_calls]
+                chunks.append(f"[assistant tool calls]\n{json.dumps(calls, ensure_ascii=False)}")
+        snapshot = "\n\n".join(chunks)
+        if not snapshot.strip():
+            return {"success": True, "processed": 0, "message": "No conversation content to distill."}
+        if len(snapshot) > 60_000:
+            snapshot = snapshot[-60_000:]
+        result = await MemoryDistiller(
+            self.memory_store,
+            model=self.model,
+            options=self._request_options(),
+            allowed_targets=allowed,
+        ).run_snapshot(snapshot, session_id=self.session_id)
+        if result.get("success"):
+            self._refresh_memory_context()
+        return result
+
     async def compact(
         self,
         *,
@@ -354,6 +459,9 @@ class AgentSession:
         options: ModelRequestOptions | None = None,
     ) -> CompactionResult:
         self._ensure_session()
+        preserved_plan_state = self.plan_state
+        preserved_todo_state = self._load_todo_state()
+        preserved_long_task_state = self.long_task_state
         path_entries = self.session_store.path_entries(self.session_id)
         plan = prepare_compaction(path_entries, CompactionSettings())
         if plan is None:
@@ -364,7 +472,7 @@ class AgentSession:
         compacted_messages.append(Message(role="system", content=f"Previous conversation summary:\n{summary}"))
         compacted_messages.extend(plan.kept_messages)
         tokens_after = estimate_messages_tokens(compacted_messages)
-        self.session_store.append_compaction(
+        parent_id = self.session_store.append_compaction(
             self.session_id,
             summary=summary,
             first_kept_entry_id=plan.first_kept_entry_id,
@@ -375,22 +483,34 @@ class AgentSession:
                 "estimatedTokensAfter": tokens_after,
             },
         )
-        if self.config.memory_enabled:
-            try:
-                self.memory_store.append_history(
-                    summary=summary,
-                    source="compaction",
-                    session_id=self.session_id,
-                    metadata={
-                        "reason": reason,
-                        "focus": focus,
-                        "first_kept_entry_id": plan.first_kept_entry_id,
-                        "tokens_before": plan.tokens_before,
-                        "tokens_after": tokens_after,
-                    },
-                )
-            except Exception:
-                logger.warning("memory_history_append_failed session_id=%s", self.session_id, exc_info=True)
+        parent_id = self.session_store.append_custom(
+            self.session_id,
+            preserved_plan_state.to_dict(),
+            parent_id=parent_id,
+        )
+        parent_id = self.session_store.append_custom(
+            self.session_id,
+            preserved_todo_state.to_dict(),
+            parent_id=parent_id,
+        )
+        long_task_payload = (
+            preserved_long_task_state.to_ref().to_dict()
+            if preserved_long_task_state.task_id
+            else preserved_long_task_state.to_session_state_dict()
+        )
+        self.session_store.append_custom(self.session_id, long_task_payload, parent_id=parent_id)
+        await self.hooks.emit(
+            CompactionCompleted(
+                session_id=self.session_id,
+                workspace=self.cwd,
+                summary=summary,
+                reason=reason,
+                focus=focus,
+                first_kept_entry_id=plan.first_kept_entry_id,
+                tokens_before=plan.tokens_before,
+                tokens_after=tokens_after,
+            )
+        )
         self.session = self.session_store.info(self.session_id)
         self.plan_state = self._load_plan_state()
         self.todo_state = self._load_todo_state()
@@ -502,6 +622,33 @@ class AgentSession:
         if self.subagents_enabled:
             return tools
         return [tool for tool in tools if tool.name != "spawn_subagents"]
+
+    async def _ensure_mcp_tools(self) -> None:
+        await self.mcp.ensure_connected()
+        if self._mcp_revision == self.mcp.revision:
+            return
+        self._edit_tools = [tool for tool in self._edit_tools if tool.name not in self._mcp_tool_names]
+        self._plan_tools = [tool for tool in self._plan_tools if tool.name not in self._mcp_tool_names]
+        existing = {tool.name for tool in [*self._edit_tools, *self._plan_tools]}
+        mcp_tools = [tool for tool in self.mcp.tools() if tool.name not in existing]
+        self._edit_tools.extend(mcp_tools)
+        plan_names = {tool.name for tool in self._plan_tools}
+        self._plan_tools.extend(tool for tool in self.mcp.read_only_tools() if tool.name not in plan_names)
+        self._mcp_tool_names = {tool.name for tool in mcp_tools}
+        self._mcp_revision = self.mcp.revision
+        self._refresh_system_message()
+
+    async def reload_mcp(self) -> None:
+        old_names = {tool.name for tool in self.mcp.tools()}
+        self._edit_tools = [tool for tool in self._edit_tools if tool.name not in old_names]
+        self._plan_tools = [tool for tool in self._plan_tools if tool.name not in old_names]
+        self._mcp_revision = -1
+        self._mcp_tool_names.clear()
+        await self.mcp.reload()
+        await self._ensure_mcp_tools()
+
+    async def aclose(self) -> None:
+        await self.mcp.close()
 
     def _subagent_tool_candidates(self) -> list:
         return [
@@ -643,7 +790,7 @@ class AgentSession:
             return TodoState()
         state = TodoState()
         try:
-            entries = self.session_store.entries(self.session.id)
+            entries = self.session_store.path_entries(self.session.id)
         except ValueError:
             return state
         for entry in entries:
