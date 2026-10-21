@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from spice.agent.sessions import SessionEntry
 from spice.llm.models import Model, ModelPricing
 from spice.llm.usage import (
@@ -11,7 +15,11 @@ from spice.llm.usage import (
     normalize_anthropic_usage,
     normalize_gemini_usage,
     normalize_openai_usage,
+    track_model_stream,
+    usage_scope,
+    usage_token_text,
 )
+from spice.llm.types import Done, StreamError, TextDelta
 
 
 def test_provider_usage_is_normalized() -> None:
@@ -111,3 +119,111 @@ def test_session_usage_counts_all_branches() -> None:
     assert summary.model_calls == 2
     assert summary.input_tokens == 20
     assert summary.estimated_cost_usd == "0.03"
+
+
+def test_missing_usage_is_not_priced_as_zero():
+    model = Model(id="priced", provider="test", pricing=ModelPricing("1", "2"))
+    record = make_usage_record(model, None, duration_ms=1)
+    assert record.estimated_cost_usd is None
+    assert not record.usage_available
+    assert ModelUsageRecord.from_dict(record.to_dict()) == record
+    summary = aggregate_usage_records([record])
+    assert summary.usage_unavailable_calls == 1
+    assert summary.unpriced_calls == 1
+    assert "未知" in usage_token_text(summary, summary.total_tokens)
+    known = make_usage_record(model, TokenUsage(10, 5), duration_ms=1)
+    summary = aggregate_usage_records([record, known])
+    assert usage_token_text(summary, summary.total_tokens).startswith(">= 15")
+
+
+def test_usage_ledger_deduplicates_message_and_custom_record():
+    record = make_usage_record(Model(id="test", provider="test"), TokenUsage(10, 2), duration_ms=1)
+    entries = [
+        SessionEntry("ledger", "custom", "", None, {"customType": "model_usage", "usage": record.to_dict()}),
+        SessionEntry("message", "message", "", "ledger", {
+            "message": {"role": "assistant", "metadata": {"usage": record.to_dict()}}}),
+    ]
+    for ordered in (entries, list(reversed(entries))):
+        assert aggregate_session_usage(ordered).model_calls == 1
+
+
+@pytest.mark.parametrize("ending", ["done", "missing_usage", "error", "exception", "incomplete", "cancelled"])
+def test_request_tracker_records_each_outcome_once(ending):
+    recorded = []
+    model = Model(id="test", provider="test")
+
+    async def stream():
+        yield TextDelta("partial")
+        if ending == "done":
+            yield Done("stop", TokenUsage(10, 3))
+        elif ending == "missing_usage":
+            yield Done("stop")
+        elif ending == "error":
+            yield StreamError("failed")
+        elif ending == "exception":
+            raise RuntimeError("failed")
+        elif ending == "cancelled":
+            raise asyncio.CancelledError()
+
+    async def run():
+        with usage_scope(recorded.append):
+            try:
+                return [event async for event in track_model_stream(model, stream, source="compaction")]
+            except (RuntimeError, asyncio.CancelledError):
+                return []
+
+    events = asyncio.run(run())
+    assert len(recorded) == 1
+    assert recorded[0].source == "compaction"
+    assert recorded[0].usage_available == (ending == "done")
+    if ending in {"done", "missing_usage"}:
+        assert events[-1].usage_record.call_id == recorded[0].call_id
+    if ending == "cancelled":
+        assert recorded[0].status == "cancelled"
+
+
+@pytest.mark.parametrize("finish", [
+    "incomplete", "length", "max_tokens", "max_output_tokens", "content_filter", "error",
+])
+def test_incomplete_terminal_response_keeps_usage_without_claiming_completion(finish):
+    recorded = []
+
+    async def stream():
+        yield Done(finish, TokenUsage(100, 16000))
+
+    async def run():
+        with usage_scope(recorded.append):
+            return [event async for event in track_model_stream(
+                Model(id="test", provider="test"), stream,
+            )]
+
+    events = asyncio.run(run())
+    assert len(recorded) == 1
+    assert recorded[0].status == "incomplete"
+    assert recorded[0].usage_available
+    assert recorded[0].tokens.output_tokens == 16000
+    assert events[-1].usage_record.call_id == recorded[0].call_id
+
+
+def test_usage_observer_isolates_concurrent_sessions_and_inherits_child_tasks():
+    first, second = [], []
+    model = Model(id="test", provider="test")
+
+    async def stream():
+        await asyncio.sleep(0)
+        yield Done("stop", TokenUsage(1, 1))
+
+    async def call():
+        return [event async for event in track_model_stream(model, stream, source="subagent")]
+
+    async def session(sink):
+        with usage_scope(sink.append):
+            await asyncio.gather(call(), call())
+
+    async def run():
+        await asyncio.gather(session(first), session(second))
+        await call()
+
+    asyncio.run(run())
+    assert len(first) == len(second) == 2
+    assert len({r.call_id for r in first + second}) == 4

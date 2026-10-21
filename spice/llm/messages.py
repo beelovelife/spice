@@ -11,6 +11,19 @@ from typing import Any, Literal
 Role = Literal["system", "user", "assistant", "tool"]
 
 
+@dataclass(frozen=True)
+class ImageContent:
+    media_type: str
+    data: str = field(repr=False)
+    width: int
+    height: int
+    source: str | None = None
+
+    @property
+    def data_url(self) -> str:
+        return f"data:{self.media_type};base64,{self.data}"
+
+
 @dataclass
 class ToolCall:
     id: str
@@ -29,3 +42,4 @@ class Message:
     provider: str | None = None
     model: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    images: list[ImageContent] = field(default_factory=list)

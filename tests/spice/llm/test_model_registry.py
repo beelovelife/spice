@@ -10,6 +10,42 @@ from spice.llm.provider_registry import get_provider
 
 
 class ModelRegistryTests(unittest.TestCase):
+    def test_current_deepseek_flash_and_legacy_selection_use_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ModelRegistry(Path(directory) / "missing-settings.json")
+            flash = registry.find("deepseek", "deepseek-flash")
+
+            self.assertIsNotNone(flash)
+            self.assertEqual(flash.id, "deepseek-flash")
+            self.assertEqual(flash.display_name, "DeepSeek V4.1 Flash")
+            self.assertTrue(flash.supports_vision)
+            self.assertTrue(flash.supports_reasoning)
+            self.assertEqual(flash.protocol, "openai-responses")
+            provider = get_provider("deepseek", protocol=flash.protocol, model=flash)
+            self.assertTrue(getattr(provider, "use_responses", False))
+            self.assertEqual(flash.pricing.input_per_million_usd, "0.3")
+            self.assertEqual(flash.pricing.output_per_million_usd, "1.2")
+            self.assertEqual(flash.pricing.cache_read_per_million_usd, "0.006")
+            for provider_name, model_id in (
+                ("deepseek", "deepseek-v4-flash"),
+                (None, "deepseek-v4-flash"),
+                (None, "deepseek/deepseek-v4-flash"),
+            ):
+                with self.subTest(provider=provider_name, model=model_id):
+                    self.assertIs(registry.find(provider_name, model_id), flash)
+            self.assertEqual(
+                [model.id for model in registry.all() if model.provider == "deepseek"],
+                ["deepseek-flash", "deepseek-v4-pro"],
+            )
+
+    def test_builtin_vision_models_enable_image_input(self) -> None:
+        registry = ModelRegistry()
+        for provider, model_id in (
+            ("openai", "gpt-4o"), ("openai", "gpt-5.1"),
+            ("anthropic", "claude-sonnet-4-6"), ("gemini", "gemini-2.5-pro"),
+        ):
+            self.assertTrue(registry.find(provider, model_id).supports_vision)
+
     def test_current_anthropic_models_are_built_in(self) -> None:
         registry = ModelRegistry()
 

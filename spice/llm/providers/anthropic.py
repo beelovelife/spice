@@ -81,7 +81,11 @@ class AnthropicProvider:
                     message.stop_reason,
                     int((time.perf_counter() - started) * 1000),
                 )
-                yield Done(message.stop_reason, usage=normalize_anthropic_usage(message.usage))
+                yield Done(
+                    message.stop_reason,
+                    usage=normalize_anthropic_usage(message.usage),
+                    output_token_limit=options.max_tokens,
+                )
         except Exception as exc:
             logger.exception(
                 "provider_request_error provider=Anthropic model=%s duration_ms=%d",
@@ -110,7 +114,9 @@ def _messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str,
                         {
                             "type": "tool_result",
                             "tool_use_id": message.tool_call_id,
-                            "content": message.content,
+                            "content": (
+                                _image_content(message) if message.images else message.content
+                            ),
                             "is_error": message.is_error,
                         }
                     ],
@@ -123,9 +129,29 @@ def _messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str,
             for tc in message.tool_calls:
                 content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments})
             output.append({"role": "assistant", "content": content or [{"type": "text", "text": ""}]})
+        elif message.role == "user" and message.images:
+            output.append({"role": "user", "content": _image_content(message)})
         else:
             output.append({"role": "user", "content": message.content})
     return "\n\n".join(system_parts), output
+
+
+def _image_content(message: Message) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    if message.content:
+        content.append({"type": "text", "text": message.content})
+    content.extend(
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data,
+            },
+        }
+        for image in message.images
+    )
+    return content
 
 
 def _tool_to_anthropic(tool: ToolSchema) -> dict[str, Any]:

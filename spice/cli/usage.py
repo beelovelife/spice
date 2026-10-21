@@ -7,7 +7,7 @@ from typing import Any
 
 from rich.table import Table
 
-from spice.llm.usage import SessionUsageSummary, aggregate_session_usage
+from spice.llm.usage import SessionUsageSummary, aggregate_session_usage, usage_token_text
 
 
 def session_usage_summary(agent_session: Any) -> SessionUsageSummary:
@@ -19,14 +19,16 @@ def session_usage_summary(agent_session: Any) -> SessionUsageSummary:
 def build_usage_table(summary: SessionUsageSummary) -> Table:
     table = Table("Metric", "Value", title="Session usage")
     table.add_row("Model calls", f"{summary.model_calls:,}")
-    table.add_row("Input tokens", f"{summary.input_tokens:,}")
+    table.add_row("Input tokens", usage_token_text(summary, summary.input_tokens))
     table.add_row("Cache hit", _cache_hit_text(summary))
     table.add_row("Cache read", f"{summary.cache_read_tokens:,}")
     table.add_row("Cache write", f"{summary.cache_write_tokens:,}")
-    table.add_row("Output tokens", f"{summary.output_tokens:,}")
-    table.add_row("Total tokens", f"{summary.total_tokens:,}")
+    table.add_row("Output tokens", usage_token_text(summary, summary.output_tokens))
+    table.add_row("Total tokens", usage_token_text(summary, summary.total_tokens))
     table.add_row("Model time", _duration_text(summary.duration_ms))
     table.add_row("Estimated cost", _cost_text(summary))
+    table.add_row("缺失 usage 的调用", str(summary.usage_unavailable_calls))
+    table.add_row("调用来源", ", ".join(f"{source}: {count}" for source, count in sorted(summary.calls_by_source.items())))
     return table
 
 

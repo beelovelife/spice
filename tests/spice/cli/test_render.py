@@ -19,9 +19,11 @@ from spice.agent.events import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnEndEvent,
+    TurnFinalizationStartEvent,
     TurnStartEvent,
 )
 from spice.cli.render import CliRenderer
+from spice.agent.turn_outcome import TurnCheckpoint
 from spice.tools.base import tool_error, tool_result
 
 
@@ -30,6 +32,22 @@ def _console() -> tuple[Console, StringIO]:
     return Console(
         file=output, force_terminal=False, color_system=None, width=100
     ), output
+
+
+def test_round_budget_finalization_is_rendered_as_a_pause():
+    console, output = _console()
+    renderer = CliRenderer(console, markdown=False)
+    checkpoint = TurnCheckpoint("task", 100, 100, summary="已写入代码，仍需验收。")
+    for event in [
+        TurnStartEvent("work"), TurnFinalizationStartEvent(100, 100),
+        TextDeltaEvent(checkpoint.summary), AssistantMessageEvent(checkpoint.summary, []),
+        TurnEndEvent(checkpoint.summary, "max_tool_rounds", checkpoint=checkpoint),
+    ]:
+        renderer.render_event(event)
+    rendered = output.getvalue()
+    assert rendered.count(checkpoint.summary) == 1
+    assert "暂停待继续" in rendered and "100" in rendered
+    assert "Error:" not in rendered
 
 
 def test_markdown_renderer_renders_streamed_tables() -> None:
@@ -166,7 +184,7 @@ def test_renderer_does_not_emit_waiting_indicator_for_non_terminal_output() -> N
     renderer.render_event(AssistantMessageEvent(text="你好", tool_calls=[]))
 
     rendered = output.getvalue()
-    assert rendered == "Spice: 你好\r\n\r\n"
+    assert rendered == "你好\r\n\r\n"
     assert "thinking" not in rendered
 
 
@@ -182,12 +200,17 @@ def test_renderer_streams_reasoning_only_to_interactive_terminal() -> None:
 
     renderer.render_event(TurnStartEvent(prompt="plain"))
     renderer.render_event(ReasoningDeltaEvent("check context"))
+    assert renderer._reasoning_streaming is True
+    assert renderer._reasoning_buffer == "check context"
     renderer.render_event(TextDeltaEvent("answer"))
     renderer.render_event(AssistantMessageEvent(text="answer", tool_calls=[]))
 
     rendered = terminal_output.getvalue()
-    assert "Thinking: check context" in rendered
-    assert "Spice: answer" in rendered
+    assert "Thought for" in rendered
+    assert "/thinking to view" in rendered
+    assert renderer.last_reasoning == "check context"
+    assert "answer" in rendered
+    assert "Spice:" not in rendered
 
     console, piped_output = _console()
     piped_renderer = CliRenderer(console, markdown=False)
@@ -205,7 +228,7 @@ def test_renderer_prints_final_text_when_no_delta_was_streamed() -> None:
     renderer.render_event(TurnStartEvent(prompt="plain"))
     renderer.render_event(AssistantMessageEvent(text="final answer", tool_calls=[]))
 
-    assert output.getvalue() == "Spice: final answer\r\n\r\n"
+    assert output.getvalue() == "final answer\r\n\r\n"
 
 
 def test_markdown_renderer_finishes_plain_stream_on_new_line() -> None:
@@ -233,7 +256,7 @@ def test_markdown_renderer_finishes_text_before_tool_start() -> None:
     )
 
     rendered = output.getvalue()
-    assert "先说明一句，不带换行\r\n❯ Run: echo ok" in rendered
+    assert "先说明一句，不带换行\r\n⌘ Run: echo ok" in rendered
 
 
 def test_markdown_renderer_flushes_pending_table_before_tool_start() -> None:
@@ -252,8 +275,8 @@ def test_markdown_renderer_flushes_pending_table_before_tool_start() -> None:
     assert "名称" in rendered
     assert "值" in rendered
     assert "╭" in rendered
-    assert "❯ Run: echo ok" in rendered
-    assert rendered.index("╭") < rendered.index("❯ Run: echo ok")
+    assert "⌘ Run: echo ok" in rendered
+    assert rendered.index("╭") < rendered.index("⌘ Run: echo ok")
 
 
 def test_markdown_renderer_does_not_treat_pipe_text_as_table_without_divider() -> None:
@@ -301,9 +324,9 @@ def test_finish_response_uses_carriage_return_before_next_prompt() -> None:
     renderer.render_event(TurnStartEvent(prompt="plain"))
     renderer.render_event(TextDeltaEvent("answer"))
     renderer.finish_response()
-    output.write("spice ❯ ")
+    output.write("> ")
 
-    assert output.getvalue().endswith("answer\r\n\r\nspice ❯ ")
+    assert output.getvalue().endswith("answer\r\n\r\n> ")
 
 
 def test_renderer_summarizes_read_file_results() -> None:

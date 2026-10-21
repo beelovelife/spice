@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from spice.agent.logging_config import get_logger
 from spice.llm.config import CONFIG_DIR
-from spice.llm.messages import Message, ToolCall
+from spice.llm.messages import ImageContent, Message, ToolCall
 
 SESSION_VERSION = 1
 DEFAULT_SESSIONS_DIR = CONFIG_DIR / "sessions"
@@ -106,6 +106,8 @@ def message_to_dict(message: Message) -> dict[str, Any]:
         data["is_error"] = True
     if message.metadata:
         data["metadata"] = message.metadata
+    if message.images:
+        data["images"] = [asdict(image) for image in message.images]
     return data
 
 
@@ -128,6 +130,7 @@ def message_from_dict(data: dict[str, Any]) -> Message:
         provider=data.get("provider"),
         model=data.get("model"),
         metadata=dict(data.get("metadata") or {}),
+        images=[ImageContent(**image) for image in data.get("images", [])],
     )
 
 
@@ -387,8 +390,16 @@ class SessionStore:
 
     def _append_json(self, path: Path, row: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        with path.open("ab+") as handle:
+            # Preserve an interrupted final row, but never concatenate a fresh
+            # fact onto it: the reader would discard both as malformed JSON.
+            handle.seek(0, 2)
+            if handle.tell():
+                handle.seek(-1, 2)
+                if handle.read(1) != b"\n":
+                    payload = b"\n" + payload
+            handle.write(payload)
 
     def _read(self, path: Path) -> tuple[dict[str, Any], list[SessionEntry]]:
         rows = []
@@ -474,6 +485,7 @@ def _stub_older_tool_results(messages: list[Message]) -> list[Message]:
                     name=message.name,
                     is_error=message.is_error,
                     metadata=message.metadata,
+                    images=list(message.images),
                 )
             )
         else:

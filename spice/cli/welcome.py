@@ -28,8 +28,13 @@ WELCOME_QUOTES: list[WelcomeQuote] = [
     ("This is only the beginning.", "这仅仅是个开始。"),
 ]
 
+
+def choose_welcome_quote() -> WelcomeQuote:
+    return random.choice(WELCOME_QUOTES)
+
+
 def print_welcome(console: Console) -> None:
-    english, chinese = random.choice(WELCOME_QUOTES)
+    english, chinese = choose_welcome_quote()
     console.print(
         Panel.fit(
             "\n".join(
@@ -47,7 +52,7 @@ def print_welcome(console: Console) -> None:
     )
 
 def print_compact_welcome(console: Console) -> None:
-    english, chinese = random.choice(WELCOME_QUOTES)
+    english, chinese = choose_welcome_quote()
     console.print(
         Panel.fit(
             "\n".join([f"[bold]{english}[/bold]", f"[cyan]{chinese}[/cyan]"]),

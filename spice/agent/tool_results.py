@@ -6,10 +6,22 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from spice.llm.messages import Message
+from spice.llm.messages import Message, ToolCall
 from spice.tools.base import ToolResult, truncate_head_tail
 
 MAX_INLINE_TOOL_OUTPUT = 12_000
+
+
+def tool_result_message(call: ToolCall, result: ToolResult) -> Message:
+    """Use the same result representation for history and recovery checkpoints."""
+    metadata = build_tool_result_metadata(call.name, call.arguments, result)
+    if result.full_content is not None:
+        metadata["_full_tool_output"] = result.full_content
+    return Message(
+        role="tool", content=result.content, tool_call_id=call.id,
+        name=call.name, is_error=result.is_error, metadata=metadata,
+        images=list(result.images),
+    )
 
 
 def build_tool_result_metadata(tool_name: str, arguments: dict[str, Any], result: ToolResult) -> dict[str, Any]:
@@ -82,6 +94,7 @@ def prepare_tool_message_for_session(message: Message, *, cwd: Path, session_id:
         provider=message.provider,
         model=message.model,
         metadata=metadata,
+        images=list(message.images),
     )
 
 

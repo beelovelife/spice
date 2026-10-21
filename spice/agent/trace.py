@@ -25,6 +25,7 @@ from spice.agent.events import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnEndEvent,
+    TurnFinalizationStartEvent,
     TurnStartEvent,
 )
 from spice.llm.config import CONFIG_DIR
@@ -140,6 +141,9 @@ class RunTraceWriter:
                 }
             )
             should_flush = True
+        elif isinstance(event, TurnFinalizationStartEvent):
+            self.events.append({"type": "turn_finalization_start", **asdict(event), "timestamp": _now()})
+            should_flush = True
         elif isinstance(event, AssistantMessageEvent):
             if event.usage is not None:
                 self.usage_records.append(event.usage)
@@ -186,17 +190,18 @@ class RunTraceWriter:
             )
         elif isinstance(event, TurnEndEvent):
             self.stop_reason = event.stop_reason
+            if self.status not in {"error", "interrupted"}:
+                self.status = "error" if event.status == "failed" else event.status
             self.events.append(
                 {
                     "type": "turn_end",
-                    "text": event.text,
-                    "stop_reason": event.stop_reason,
+                    **asdict(event),
                     "timestamp": _now(),
                 }
             )
             should_flush = True
         elif isinstance(event, AgentErrorEvent):
-            self.status = "interrupted" if event.kind == "user_interrupted" else "error"
+            self.status = "interrupted" if event.kind in {"user_interrupted", "consumer_closed"} else "error"
             self.error = event.message
             self.events.append(
                 {
@@ -208,7 +213,7 @@ class RunTraceWriter:
             )
             should_flush = True
         elif isinstance(event, AgentEndEvent):
-            if self.status not in {"error", "interrupted"}:
+            if self.status not in {"error", "interrupted", "paused"}:
                 self.status = "completed"
             self.events.append(
                 {
@@ -293,6 +298,11 @@ def _message_to_dict(message: Message) -> dict[str, Any]:
         "role": message.role,
         "content": message.content,
     }
+    if message.images:
+        data["images"] = [
+            {"media_type": image.media_type, "width": image.width, "height": image.height, "source": image.source}
+            for image in message.images
+        ]
     if message.tool_calls:
         data["tool_calls"] = [_tool_call_to_dict(call) for call in message.tool_calls]
     for attr in ("tool_call_id", "name", "provider", "model"):

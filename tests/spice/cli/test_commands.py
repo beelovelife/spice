@@ -4,13 +4,17 @@ import asyncio
 from dataclasses import dataclass
 from io import StringIO
 import unittest
+from types import SimpleNamespace
+
+import pytest
 
 import spice.cli.main as cli_main
 import spice.cli.commands as cli_commands
 import spice.cli.run_interactive as run_interactive
 from spice.cli.commands import InteractiveCommandContext, SlashCommandRegistry
 from spice.agent.tool_results import build_tool_result_metadata
-from spice.agent.sessions import SessionEntry, SessionInfo
+from spice.agent.sessions import SessionEntry, SessionInfo, SessionStore
+from spice.agent.session_history import AGENT_ERROR_ENTRY, HistoryError
 from spice.llm.config import SpiceConfig
 from spice.llm.messages import Message
 from spice.llm.models import Model
@@ -66,6 +70,72 @@ class SlashCommandRegistryTests(unittest.TestCase):
         self.assertEqual([completion.text for completion in completions], ["/skills", "/skill"])
 
 
+def test_session_history_uses_user_prompt_without_assistant_label() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=80)
+
+    cli_commands._print_session_history(
+        console,
+        [
+            Message(role="user", content="question"),
+            Message(role="assistant", content="answer"),
+        ],
+    )
+
+    rendered = output.getvalue()
+    assert "> question" in rendered
+    assert "answer" in rendered
+    assert "You:" not in rendered
+    assert "Spice:" not in rendered
+
+
+def test_cli_replays_historical_errors_in_order_as_literal_text():
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    cli_commands._print_session_history(console, [
+        Message(role="user", content="first request"),
+        HistoryError("length limit exceeded [unknown]", "error", "2026-10-20T00:00:00+08:00"),
+        Message(role="user", content="continue"),
+        Message(role="assistant", content="finished"),
+    ])
+    rendered = output.getvalue()
+    assert "历史错误：length limit exceeded [unknown]" in rendered
+    assert rendered.index("first request") < rendered.index("历史错误") < rendered.index("continue") < rendered.index("finished")
+
+
+def test_cli_startup_restores_the_last_error(tmp_path, monkeypatch):
+    store = SessionStore(tmp_path / "sessions", cwd=tmp_path)
+    info = store.create(cwd=tmp_path, provider="fake", model="fake")
+    store.append_message(info.id, Message(role="user", content="first request"))
+    store.append_custom(info.id, {"customType": AGENT_ERROR_ENTRY, "message": "request too large", "kind": "error"})
+    session = SimpleNamespace(
+        session_store=store, session=info, session_label=info.id,
+        extensions=SimpleNamespace(errors=[], commands=lambda: {}),
+        plan_state=SimpleNamespace(mode="edit", is_plan_mode=False),
+    )
+
+    class Input:
+        def __init__(self, *args, **kwargs):
+            self.completer = kwargs.get("completer")
+
+        async def prompt_async(self, *args, **kwargs):
+            return "quit"
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    monkeypatch.setattr(run_interactive, "AgentSession", lambda **kwargs: session)
+    monkeypatch.setattr(run_interactive, "UpwardCompletionPromptSession", Input)
+    monkeypatch.setattr(run_interactive, "preserve_cursor_blink", lambda: None)
+    monkeypatch.setattr(run_interactive, "print_compact_welcome", lambda console: None)
+    monkeypatch.setattr(run_interactive.sys.stdin, "isatty", lambda: True)
+
+    asyncio.run(run_interactive.run_conversation(console, session_id=info.id))
+
+    rendered = output.getvalue()
+    assert "历史错误：request too large" in rendered
+    assert rendered.index("first request") < rendered.index("历史错误")
+
+
 def test_memory_slash_command_defaults_to_current_project() -> None:
     calls = []
 
@@ -106,6 +176,17 @@ def test_chat_and_tui_accept_trace_options(monkeypatch) -> None:
     assert tui.exit_code == 0
     assert "--trace" in tui.output
     assert "--trace-file" in tui.output
+
+
+def test_top_level_commands_are_registered(monkeypatch) -> None:
+    """Every top-level command must stay registered; a missing decorator (e.g.
+    `logs`) should fail this test rather than disappearing silently."""
+    monkeypatch.setattr(cli_main, "set_process_title", lambda: None)
+
+    result = CliRunner().invoke(cli_main.app, ["--help"])
+    assert result.exit_code == 0
+    for command in ("doctor", "chat", "tui", "run", "models", "logs", "resume"):
+        assert command in result.output, f"missing top-level command: {command}"
 
 
 def test_interactive_entrypoint_uses_async_prompt(monkeypatch) -> None:
@@ -186,6 +267,59 @@ def test_interactive_cli_adds_blank_line_before_response(monkeypatch) -> None:
     asyncio.run(run_interactive.run_conversation(console))
 
     assert output_before_response[0].endswith("Session: new\n\n")
+
+
+@pytest.mark.parametrize(
+    ("raw", "invoked"),
+    [("/skill:demo 检查项目", True), ("/skill --show demo", False), ("/skill:missing", False)],
+)
+def test_interactive_cli_executes_skill_but_not_show_or_missing(
+    tmp_path, monkeypatch, raw, invoked
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    skill_file = tmp_path / ".spice" / "skills" / "demo" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        "---\nname: demo\ndescription: 测试技能\n---\n检查项目并报告结果。\n",
+        encoding="utf-8",
+    )
+    prompts = []
+
+    class FakeAgentSession:
+        session_label = "new"
+        extensions = SimpleNamespace(errors=[], commands=lambda: {})
+        plan_state = SimpleNamespace(mode="edit", is_plan_mode=False, steps=[])
+
+        async def prompt(self, text):
+            prompts.append(text)
+            if False:
+                yield
+
+    class FakePromptSession:
+        def __init__(self, *args, **kwargs) -> None:
+            self.completer = kwargs.get("completer")
+            self.bottom_toolbar = None
+            self.messages = iter([raw, "/quit"])
+
+        async def prompt_async(self, *args, **kwargs) -> str:
+            return next(self.messages)
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    monkeypatch.setattr(run_interactive, "AgentSession", lambda **kwargs: FakeAgentSession())
+    monkeypatch.setattr(run_interactive, "UpwardCompletionPromptSession", FakePromptSession)
+    monkeypatch.setattr(run_interactive, "preserve_cursor_blink", lambda: None)
+    monkeypatch.setattr(run_interactive, "print_compact_welcome", lambda console: None)
+    monkeypatch.setattr(run_interactive.sys.stdin, "isatty", lambda: True)
+
+    asyncio.run(run_interactive.run_conversation(console))
+
+    assert len(prompts) == int(invoked)
+    if invoked:
+        assert skill_file.read_text(encoding="utf-8") in prompts[0]
+        assert prompts[0].endswith("检查项目")
+    elif "--show" in raw:
+        assert "检查项目并报告结果。" in output.getvalue()
 
 
 def test_interactive_clear_alias_routes_to_clear_command(monkeypatch) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import asdict
 from collections.abc import Callable
 from typing import Any
 
@@ -20,9 +21,11 @@ from spice.agent.events import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnEndEvent,
+    TurnFinalizationStartEvent,
     TurnStartEvent,
 )
 from spice.extensions.manager import ExtensionEvent, ExtensionManager
+from spice.llm.error_safety import sanitize_error_text
 
 AgentSessionListener = Callable[[AgentEvent], Any]
 
@@ -53,14 +56,19 @@ class AgentEventDispatcher:
         return unsubscribe
 
     async def dispatch(self, event: AgentEvent) -> None:
-        await self._emit_extension_observer_event(event)
+        try:
+            await self._emit_extension_observer_event(event)
+        except Exception as exc:
+            # Runtime observers are notifications. Blocking tool policy hooks
+            # still run separately in the tool executor and must fail closed.
+            self.listener_errors.append(sanitize_error_text(str(exc)))
         for listener in tuple(self._listeners):
             try:
                 result = listener(event)
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
-                self.listener_errors.append(str(exc))
+                self.listener_errors.append(sanitize_error_text(str(exc)))
 
     async def _emit_extension_observer_event(self, event: AgentEvent) -> None:
         if self.extensions is None:
@@ -81,7 +89,9 @@ def _extension_event_payload(event: AgentEvent) -> tuple[str | None, dict[str, A
     if isinstance(event, RoundCompleteEvent):
         return "round_complete", {"round_index": event.round_index}
     if isinstance(event, TurnEndEvent):
-        return "turn_end", {"text": event.text}
+        return "turn_end", asdict(event)
+    if isinstance(event, TurnFinalizationStartEvent):
+        return "turn_finalization_start", asdict(event)
     if isinstance(event, TextDeltaEvent):
         return "text_delta", {"text": event.text}
     if isinstance(event, ReasoningDeltaEvent):

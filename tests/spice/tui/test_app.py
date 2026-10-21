@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
@@ -17,9 +18,15 @@ from spice.agent.events import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnStartEvent,
+    TurnEndEvent,
+    TurnFinalizationStartEvent,
 )
-from spice.llm.messages import ToolCall
+from spice.interactive.confirm import ConfirmPolicy
+from spice.agent.session_history import AGENT_ERROR_ENTRY
+from spice.agent.sessions import SessionStore
+from spice.llm.messages import Message, ToolCall
 from spice.tools.base import tool_result
+from spice.agent.turn_outcome import TurnCheckpoint
 from spice.tui.app import SpiceTUI, _InputBufferControl, _MessageBufferControl
 from spice.cli.terminal import enable_cursor_blink_after_render
 
@@ -45,6 +52,70 @@ def _minimal_tui() -> SpiceTUI:
     tui._todo_summary = {}
     tui._app = SimpleNamespace(invalidate=lambda: None)
     return tui
+
+
+def test_legacy_tui_renders_budget_summary_and_pause_without_error():
+    tui = _minimal_tui()
+    checkpoint = TurnCheckpoint("task", 100, 100, summary="已保存执行结果，剩余验收。")
+    for event in [
+        TurnStartEvent("work"), TurnFinalizationStartEvent(100, 100),
+        TextDeltaEvent(checkpoint.summary), AssistantMessageEvent(checkpoint.summary, []),
+        TurnEndEvent(checkpoint.summary, "max_tool_rounds", checkpoint=checkpoint),
+    ]:
+        tui._render_event(event)
+    rendered = tui._message_buffer.text
+    assert checkpoint.summary in rendered
+    assert "暂停待继续" in rendered
+    assert "Error:" not in rendered
+
+
+def test_legacy_tui_replays_recorded_error_in_its_original_position(tmp_path):
+    store = SessionStore(tmp_path / "sessions", cwd=tmp_path)
+    info = store.create(cwd=tmp_path, provider="fake", model="fake")
+    store.append_message(info.id, Message(role="user", content="first request"))
+    store.append_custom(info.id, {"customType": AGENT_ERROR_ENTRY, "message": "request too large", "kind": "error"})
+    store.append_message(info.id, Message(role="user", content="continue"))
+    tui = _minimal_tui()
+    tui._agent_session = SimpleNamespace(session_store=store, session=info, messages=[])
+
+    tui._display_session_history()
+
+    rendered = tui._message_buffer.text
+    assert "历史错误：request too large" in rendered
+    assert rendered.index("first request") < rendered.index("历史错误") < rendered.index("continue")
+
+
+@pytest.mark.parametrize(
+    ("raw", "invoked"),
+    [("/skill:demo 检查项目", True), ("/skill --show demo", False), ("/skill:missing", False)],
+)
+def test_legacy_tui_executes_skill_but_not_show_or_missing(
+    tmp_path, monkeypatch, raw, invoked
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    skill_file = tmp_path / ".spice" / "skills" / "demo" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        "---\nname: demo\ndescription: 测试技能\n---\n检查项目并报告结果。\n",
+        encoding="utf-8",
+    )
+    tui = _minimal_tui()
+    tui._agent_session = SimpleNamespace(extensions=None)
+    tui.confirm_policy = ConfirmPolicy()
+    prompts = []
+
+    async def run_prompt(text):
+        prompts.append(text)
+
+    monkeypatch.setattr(tui, "_run_prompt", run_prompt)
+    assert asyncio.run(tui._handle_slash_command(raw)) is True
+
+    assert len(prompts) == int(invoked)
+    if invoked:
+        assert skill_file.read_text(encoding="utf-8") in prompts[0]
+        assert prompts[0].endswith("检查项目")
+    elif "--show" in raw:
+        assert "检查项目并报告结果。" in tui._message_buffer.text
 
 
 def test_tui_reenables_cursor_blink_after_every_render() -> None:
@@ -114,7 +185,7 @@ def test_tui_replaces_waiting_activity_with_answer() -> None:
     tui._render_event(TextDeltaEvent("你好"))
     tui._render_event(AssistantMessageEvent(text="你好", tool_calls=[]))
 
-    assert tui._message_buffer.text == "Spice: 你好\n"
+    assert tui._message_buffer.text == "你好\n"
 
 
 def test_tui_streams_reasoning_before_answer() -> None:
@@ -126,7 +197,7 @@ def test_tui_streams_reasoning_before_answer() -> None:
     tui._render_event(TextDeltaEvent("结论"))
     tui._render_event(AssistantMessageEvent(text="结论", tool_calls=[]))
 
-    assert tui._message_buffer.text == "Thinking: 先检查上下文\nSpice: 结论\n"
+    assert tui._message_buffer.text == "Thinking: 先检查上下文\n结论\n"
 
 
 def test_tui_shows_retry_fallback_and_fatal_tool_stop() -> None:
@@ -162,17 +233,17 @@ def test_tui_renders_final_text_when_no_delta_was_streamed() -> None:
     tui._render_event(TurnStartEvent(prompt="hello"))
     tui._render_event(AssistantMessageEvent(text="final answer", tool_calls=[]))
 
-    assert tui._message_buffer.text == "Spice: final answer\n"
+    assert tui._message_buffer.text == "final answer\n"
 
 
 def test_tui_turn_gap_keeps_rounds_from_touching() -> None:
     tui = _minimal_tui()
-    tui._append("Spice: previous answer\n")
+    tui._append("previous answer\n")
 
     tui._ensure_turn_gap()
-    tui._append("You: next question\n")
+    tui._append("> next question\n")
 
-    assert tui._message_buffer.text == "Spice: previous answer\n\nYou: next question\n"
+    assert tui._message_buffer.text == "previous answer\n\n> next question\n"
 
 
 def test_tui_activity_status_distinguishes_generation_pause_and_tool(
@@ -202,18 +273,16 @@ def test_tui_activity_status_distinguishes_generation_pause_and_tool(
     )
 
 
-def test_tui_styles_role_labels_and_tool_rows_without_changing_text() -> None:
+def test_tui_styles_user_prompt_and_tool_rows_without_changing_text() -> None:
     tui = _minimal_tui()
-    original = (
-        "You: question\n\nSpice: answer\n  tool: web_search()\n  web_search -> done"
-    )
+    original = "> question\n\nanswer\n  tool: web_search()\n  web_search -> done"
     tui._append(original)
 
     fragments = tui._message_fragments()
 
     assert "".join(text for _, text in fragments) == original
-    assert ("class:message.user-label", "You:") in fragments
-    assert ("class:message.assistant-label", "Spice:") in fragments
+    assert ("class:message.user-label", ">") in fragments
+    assert not any(style == "class:message.assistant-label" for style, _ in fragments)
     assert any(
         style == "class:message.tool" and "tool: web_search" in text
         for style, text in fragments
@@ -546,13 +615,13 @@ def test_tui_submitting_message_leaves_history_mode_and_follows_response() -> No
         assert prompts == ["new question"]
         assert tui._message_follow_tail is True
         assert tui._message_vertical_scroll == tui._message_bottom_scroll()
-        assert tui._message_buffer.text.endswith("You: new question\n\n")
+        assert tui._message_buffer.text.endswith("> new question\n\n")
 
         tui._render_event(TurnStartEvent(prompt="new question"))
         tui._render_event(TextDeltaEvent("visible response"))
         assert tui._message_follow_tail is True
         assert tui._message_vertical_scroll == tui._message_bottom_scroll()
-        assert tui._message_buffer.text.endswith("Spice: visible response")
+        assert tui._message_buffer.text.endswith("visible response")
 
     asyncio.run(exercise())
 

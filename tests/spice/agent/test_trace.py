@@ -18,8 +18,10 @@ from spice.agent.events import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnEndEvent,
+    TurnFinalizationStartEvent,
 )
 from spice.agent.trace import RunTraceWriter, attach_trace_writer
+from spice.agent.turn_outcome import TurnCheckpoint
 from spice.llm.config import SpiceConfig
 from spice.llm.messages import Message, ToolCall
 from spice.llm.models import Model
@@ -50,6 +52,25 @@ class FakeSession:
     def emit(self, event):
         for listener in list(self._listeners):
             listener(event)
+
+
+def test_round_budget_trace_remains_paused_after_agent_end(tmp_path):
+    session = FakeSession(tmp_path)
+    writer = RunTraceWriter(tmp_path / "paused.json", session)
+    checkpoint = TurnCheckpoint("task", 100, 100, summary="Pending verification")
+    for event in [
+        AgentStartEvent("session-1"), TurnFinalizationStartEvent(100, 100),
+        TurnEndEvent(checkpoint.summary, "max_tool_rounds", checkpoint=checkpoint),
+        AgentEndEvent("session-1"),
+    ]:
+        writer.record(event)
+    data = writer.snapshot()
+    assert data["summary"]["status"] == "paused"
+    assert data["summary"]["error"] is None
+    end = next(e for e in data["events"] if e["type"] == "turn_end")
+    assert end["status"] == "paused"
+    assert end["checkpoint"]["summary"] == "Pending verification"
+    assert any(e["type"] == "turn_finalization_start" for e in data["events"])
 
 
 def test_attach_trace_writer_uses_unique_timestamped_path(
@@ -200,15 +221,16 @@ def test_run_command_trace_file_wires_runtime_writer(
         def __new__(cls, **kwargs):
             return fake_session
 
-    async def fake_render_prompt(session, renderer, prompt):
+    async def fake_run_once(session, renderer, prompt):
         session.session = type("SessionInfo", (), {"id": "created-session"})()
         session.messages.append(Message(role="user", content=prompt))
         session.emit(AgentStartEvent(session_id="created-session"))
         session.emit(TurnEndEvent(text="done", stop_reason="stop"))
         session.emit(AgentEndEvent(session_id="created-session"))
+        return 0
 
     monkeypatch.setattr(cli_main, "AgentSession", FakeAgentSession)
-    monkeypatch.setattr(cli_main, "run_prompt", fake_render_prompt)
+    monkeypatch.setattr(cli_main, "_run_once", fake_run_once)
 
     cli_main.run("hello", trace_file=trace_path)
 

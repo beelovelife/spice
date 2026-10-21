@@ -319,7 +319,7 @@ class ProviderConversionTests(unittest.TestCase):
             part = SimpleNamespace(text="hello", function_call=None)
             content = SimpleNamespace(parts=[part])
             yield SimpleNamespace(
-                usage_metadata=None, candidates=[SimpleNamespace(content=content)]
+                usage_metadata=None, candidates=[SimpleNamespace(content=content, finish_reason="STOP")]
             )
 
         async def generate_content_stream(**_kwargs):

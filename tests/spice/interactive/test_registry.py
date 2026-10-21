@@ -6,6 +6,8 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from spice.interactive.commands import SlashCommandRegistry, handle_help
 from spice.interactive.confirm import ConfirmPolicy
 from spice.interactive.types import (
@@ -13,6 +15,7 @@ from spice.interactive.types import (
     CommandContext,
     CommandResult,
     ConfirmRequest,
+    PanelView,
     TableView,
     TextView,
 )
@@ -55,6 +58,90 @@ def test_skill_completion_does_not_duplicate_colon_entry() -> None:
     items = SlashCommandRegistry().completion_items()
     texts = [trigger for trigger, _, _ in items if trigger.startswith("/skill")]
     assert texts == ["/skills", "/skill"]
+
+
+@pytest.fixture
+def skill_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("spice.skills.loader.USER_SKILLS_DIR", tmp_path / "user-skills")
+    path = tmp_path / ".spice" / "skills" / "demo" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "---\nname: demo\ndescription: 测试技能\n---\n检查项目并报告结果。\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _execute_skill(raw: str, cwd: Path) -> CommandResult:
+    return asyncio.run(
+        SlashCommandRegistry().execute(
+            raw,
+            CommandContext(
+                session=SimpleNamespace(),  # type: ignore[arg-type]
+                cwd=cwd,
+                port=FakePort(),
+                raw=raw,
+                args="",
+                confirm_policy=ConfirmPolicy(),
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "arguments"),
+    [
+        ("/skill:demo", ""),
+        ("/skill demo", ""),
+        ("/skill:demo 检查 src，保留现有改动", "检查 src，保留现有改动"),
+        ("/skill demo 检查 src\n只报告错误", "检查 src\n只报告错误"),
+    ],
+)
+def test_skill_invocation_returns_workflow_prompt(
+    tmp_path, skill_file, raw, arguments
+) -> None:
+    result = _execute_skill(raw, tmp_path)
+
+    assert result.handled is True
+    assert result.session is None
+    assert result.followup_prompt is not None
+    assert skill_file.read_text(encoding="utf-8") in result.followup_prompt
+    assert str(skill_file.parent.resolve()) in result.followup_prompt
+    if arguments:
+        assert result.followup_prompt.endswith(arguments)
+    assert all(not isinstance(view, TextView) or view.style != "error" for view in result.views)
+
+
+def test_skill_show_only_returns_content(tmp_path, skill_file) -> None:
+    result = _execute_skill("/skill --show demo", tmp_path)
+
+    assert result.followup_prompt is None
+    assert result.views == [TextView(skill_file.read_text(encoding="utf-8"))]
+
+
+@pytest.mark.parametrize(
+    "raw", ["/skill", "/skill:", "/skill --show", "/skill --show demo extra", "/skill:missing"]
+)
+def test_invalid_skill_command_does_not_start_a_turn(tmp_path, skill_file, raw) -> None:
+    result = _execute_skill(raw, tmp_path)
+
+    assert result.followup_prompt is None
+    assert any(isinstance(view, TextView) and view.style == "error" for view in result.views)
+
+
+def test_skill_read_failure_does_not_start_a_turn(tmp_path, skill_file, monkeypatch) -> None:
+    from spice.skills.loader import Skill, SkillLoadResult
+
+    monkeypatch.setattr(
+        "spice.interactive.commands.load_skills",
+        lambda **kwargs: SkillLoadResult(
+            [Skill("demo", "测试技能", skill_file.parent / "missing.md", "project")]
+        ),
+    )
+    result = _execute_skill("/skill:demo", tmp_path)
+
+    assert result.followup_prompt is None
+    assert any(isinstance(view, TextView) and view.style == "error" for view in result.views)
 
 
 def test_each_command_has_bound_handler() -> None:
@@ -107,6 +194,26 @@ def test_quit_and_clear_flags() -> None:
 
     clear_result = asyncio.run(run("/clear"))
     assert clear_result.clear_requested is True
+
+
+def test_thinking_command_reads_frontend_ephemeral_reasoning() -> None:
+    registry = SlashCommandRegistry()
+    result = asyncio.run(
+        registry.execute(
+            "/thinking",
+            CommandContext(
+                session=SimpleNamespace(),  # type: ignore[arg-type]
+                cwd=Path.cwd(),
+                port=FakePort(),
+                raw="/thinking",
+                args="",
+                confirm_policy=ConfirmPolicy(),
+                extras={"last_reasoning": lambda: "checked the repository"},
+            ),
+        )
+    )
+
+    assert result.views == [PanelView("Latest thinking", "checked the repository")]
 
 
 def test_unknown_command_returns_error_view() -> None:

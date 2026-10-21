@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from spice.llm.usage import TokenUsage
+from spice.llm.usage import ModelUsageRecord, TokenUsage
 
 StreamErrorKind = Literal[
     "network",
@@ -46,8 +46,20 @@ class ToolCallEvent(StreamEvent):
 
 @dataclass
 class Done(StreamEvent):
+    """Terminal provider signal, which may still describe an incomplete response."""
+
     finish_reason: str | None = None
     usage: TokenUsage | None = None
+    usage_record: ModelUsageRecord | None = None
+    incomplete_reason: str | None = None
+    output_token_limit: int | None = None
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.incomplete_reason and self.finish_reason not in {
+            "length", "max_tokens", "max_output_tokens", "content_filter",
+            "incomplete", "error",
+        }
 
 
 @dataclass

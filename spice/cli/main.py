@@ -15,14 +15,20 @@ from rich.table import Table
 import typer
 from spice.version import __version__
 from spice.agent.agent_session import AgentSession
+from spice.agent.events import AgentErrorEvent
+from spice.async_utils import closing_iterator
 from spice.agent.logging_config import configure_logging, log_level_name, log_path
-from spice.agent.memory import MemoryDistiller, MemoryStore
 from spice.agent.sessions import SessionInfo, SessionStoreProtocol
 from spice.agent.tool_results import tool_display_text
 from spice.agent.trace import attach_trace_writer
 from spice.cli.process import set_process_title
 from spice.cli.render import CliRenderer
-from spice.cli.run_interactive import run_prompt, run_conversation
+from spice.cli.run_output import RunOutput
+from spice.cli.run_interactive import run_conversation
+from spice.cli.sandbox_commands import register_sandbox_commands
+from spice.cli.mcp_commands import register_mcp_commands
+from spice.cli.memory_commands import register_memory_commands
+from spice.cli.system_commands import register_system_commands
 from spice.cli.trace_inspector import TraceInspectionError, render_trace
 from spice.llm.config import (
     SECRETS_PATH,
@@ -31,23 +37,15 @@ from spice.llm.config import (
     load_config,
     save_config,
     save_secret,
-    _read_json,
-    _write_private_json,
 )
-from spice.mcp.config import load_mcp_config
-from spice.mcp.manager import McpManager
-from spice.mcp.trust import McpTrustStore
-from spice.llm.model_registry import ModelRegistry, find_initial_model
-from spice.llm.types import ModelRequestOptions
-from spice.sandbox.factory import create_environment, create_workspace_policy
-from spice.skills.loader import load_skills, read_skill_content
+from spice.llm.model_registry import ModelRegistry
+from spice.llm.error_safety import public_exception_message
 from spice.storage.factory import (
-    create_memory_store,
     create_session_store,
+    sqlite_path as configured_sqlite_path,
     storage_backend,
 )
 from spice.storage.sqlite import init_sqlite_database
-from spice.tui import run_tui
 
 app = typer.Typer(
     add_completion=False,
@@ -58,6 +56,9 @@ app = typer.Typer(
 config_app = typer.Typer(help="Manage Spice configuration.")
 sessions_app = typer.Typer(help="Manage Spice sessions.", invoke_without_command=True)
 skills_app = typer.Typer(help="Inspect Spice skills.")
+tools_app = typer.Typer(
+    help="Inspect model-callable tools.", invoke_without_command=True
+)
 memory_app = typer.Typer(help="Manage Spice memory.")
 sandbox_app = typer.Typer(help="Manage Spice sandbox execution.")
 storage_app = typer.Typer(help="Manage Spice application-state storage.")
@@ -66,6 +67,7 @@ mcp_app = typer.Typer(help="Manage Model Context Protocol servers.")
 app.add_typer(config_app, name="config")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(skills_app, name="skills")
+app.add_typer(tools_app, name="tools")
 app.add_typer(memory_app, name="memory")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(storage_app, name="storage")
@@ -73,6 +75,15 @@ app.add_typer(trace_app, name="trace")
 app.add_typer(mcp_app, name="mcp")
 
 console = Console()
+register_system_commands(
+    app=app,
+    tools_app=tools_app,
+    skills_app=skills_app,
+    console=console,
+)
+register_mcp_commands(app=mcp_app, console=console)
+register_memory_commands(app=memory_app, console=console)
+register_sandbox_commands(app=sandbox_app, console=console)
 
 
 def _create_session_store(*, cwd: Path | None) -> SessionStoreProtocol:
@@ -97,7 +108,9 @@ def main(
     ] = False,
 ) -> None:
     """Run Spice. Without a subcommand, enter the interactive terminal."""
-    configure_logging(debug=debug)
+    # Doctor must remain usable when the configured log directory itself is broken.
+    if ctx.invoked_subcommand != "doctor":
+        configure_logging(debug=debug)
     set_process_title()
     if version:
         console.print(f"spice {__version__}")
@@ -183,16 +196,33 @@ def tui(
         Path | None,
         typer.Option("--trace-file", help="Trace output path. Implies --trace."),
     ] = None,
+    legacy: Annotated[
+        bool,
+        typer.Option(
+            "--legacy",
+            help="Use the previous prompt_toolkit TUI as a temporary fallback.",
+        ),
+    ] = False,
 ) -> None:
-    """Enter the full-screen TUI with a fixed bottom input."""
-    run_tui(
-        provider=provider,
-        model=model,
-        session_id=session_id,
-        continue_session=continue_session,
-        trace=trace or trace_file is not None,
-        trace_file=trace_file,
-    )
+    """Enter the full-screen Textual TUI."""
+    # Keep Textual out of the startup path for commands such as ``tools`` and
+    # ``doctor``. A partially upgraded global tool can then diagnose or repair
+    # itself instead of failing before Typer has parsed the subcommand.
+    from spice.tui import TuiDependencyError, run_tui
+
+    try:
+        run_tui(
+            provider=provider,
+            model=model,
+            session_id=session_id,
+            continue_session=continue_session,
+            trace=trace or trace_file is not None,
+            trace_file=trace_file,
+            legacy=legacy,
+        )
+    except TuiDependencyError as exc:
+        console.print(f"[bold red]TUI unavailable:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
@@ -220,6 +250,9 @@ def run(
             help="Render Markdown-friendly streaming output.",
         ),
     ] = True,
+    json_events: Annotated[
+        bool, typer.Option("--json", help="Stream versioned JSONL events on stdout (no interactive confirmation).")
+    ] = False,
     trace: Annotated[
         bool,
         typer.Option("--trace/--no-trace", help="Write a runtime trace JSON file."),
@@ -232,38 +265,52 @@ def run(
     ] = None,
 ) -> None:
     """Run a single prompt."""
-    renderer = CliRenderer(console, markdown=markdown)
+    renderer = RunOutput(json_events=json_events, markdown=markdown)
     try:
         agent_session = AgentSession(
             cwd=Path.cwd(),
             provider=provider,
             model_id=model,
-            confirm=renderer.confirm,
+            confirm=renderer.confirm if renderer.can_confirm else None,
             session_id=session_id,
             continue_latest=continue_session,
         )
     except RuntimeError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        renderer.render_event(AgentErrorEvent(public_exception_message(exc, prefix="Error")))
         raise typer.Exit(1) from exc
     except ValueError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        renderer.render_event(AgentErrorEvent(public_exception_message(exc, prefix="Error")))
         raise typer.Exit(1) from exc
     if trace or trace_file is not None:
         _trace_writer, trace_path = attach_trace_writer(agent_session, path=trace_file)
-        console.print(f"[dim]Trace: {trace_path}[/dim]")
-    console.print(f"[dim]Session: {agent_session.session_label}[/dim]")
-    asyncio.run(_run_once(agent_session, renderer, prompt))
+        renderer.diagnostic(f"Trace: {trace_path}")
+    renderer.diagnostic(f"Session: {agent_session.session_label}")
+    try:
+        exit_code = asyncio.run(_run_once(agent_session, renderer, prompt))
+    except KeyboardInterrupt as exc:
+        raise typer.Exit(130) from exc
+    except Exception as exc:
+        renderer.render_event(AgentErrorEvent(public_exception_message(exc, prefix="Execution failed")))
+        raise typer.Exit(1) from exc
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 async def _run_once(
-    agent_session: AgentSession, renderer: CliRenderer, prompt: str
-) -> None:
+    agent_session: AgentSession, renderer: RunOutput, prompt: str
+) -> int:
     try:
-        await run_prompt(agent_session, renderer, prompt)
+        async with closing_iterator(agent_session.prompt(prompt)) as events:
+            async for event in events:
+                renderer.render_event(event)
+        return renderer.exit_code
     finally:
-        close = getattr(agent_session, "aclose", None)
-        if close is not None:
-            await close()
+        try:
+            renderer.finish_response()
+        finally:
+            close = getattr(agent_session, "aclose", None)
+            if close is not None:
+                await close()
 
 
 @app.command()
@@ -282,287 +329,6 @@ def models() -> None:
         table.add_row(
             model.provider, model.id, model.protocol or "default", current, key
         )
-    console.print(table)
-
-
-@mcp_app.command("list")
-def mcp_list() -> None:
-    """List configured MCP servers without connecting."""
-    result = load_mcp_config(Path.cwd())
-    table = Table("Server", "Enabled", "Transport", "Source", "Endpoint")
-    for name, server in sorted(result.servers.items()):
-        endpoint = (
-            " ".join([server.command or "", *server.args]).strip()
-            if server.transport == "stdio"
-            else server.url or ""
-        )
-        table.add_row(
-            name, str(server.enabled), server.transport, server.source, endpoint
-        )
-    if result.servers:
-        console.print(table)
-    else:
-        console.print("No MCP servers configured.")
-    for error in result.errors:
-        console.print(f"[yellow]Config warning:[/yellow] {error}")
-
-
-@mcp_app.command("add")
-def mcp_add(
-    name: str,
-    command: Annotated[
-        str | None, typer.Option("--command", help="Stdio executable.")
-    ] = None,
-    url: Annotated[
-        str | None, typer.Option("--url", help="Streamable HTTP endpoint.")
-    ] = None,
-    args: Annotated[
-        list[str] | None,
-        typer.Option("--arg", help="Stdio argument; repeat for multiple values."),
-    ] = None,
-) -> None:
-    """Add or replace a global MCP server."""
-    if bool(command) == bool(url):
-        raise typer.BadParameter("Provide exactly one of --command or --url.")
-    data = _read_json(SETTINGS_PATH)
-    servers = data.setdefault("mcpServers", {})
-    if not isinstance(servers, dict):
-        raise typer.BadParameter("settings.json mcpServers must be an object")
-    server: dict[str, object] = {"enabled": True}
-    if command:
-        server.update({"command": command, "args": list(args or [])})
-    else:
-        server["url"] = url
-    servers[name] = server
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _write_private_json(SETTINGS_PATH, data)
-    console.print(f"Added MCP server {name}.")
-
-
-@mcp_app.command("remove")
-def mcp_remove(name: str) -> None:
-    """Remove a global MCP server."""
-    data = _read_json(SETTINGS_PATH)
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict) or name not in servers:
-        raise typer.BadParameter(f"Global MCP server not found: {name}")
-    del servers[name]
-    _write_private_json(SETTINGS_PATH, data)
-    console.print(f"Removed MCP server {name}.")
-
-
-def _set_mcp_enabled(name: str, enabled: bool) -> None:
-    data = _read_json(SETTINGS_PATH)
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict) or not isinstance(servers.get(name), dict):
-        raise typer.BadParameter(f"Global MCP server not found: {name}")
-    servers[name]["enabled"] = enabled
-    _write_private_json(SETTINGS_PATH, data)
-    console.print(f"{'Enabled' if enabled else 'Disabled'} MCP server {name}.")
-
-
-@mcp_app.command("enable")
-def mcp_enable(name: str) -> None:
-    """Enable a global MCP server."""
-    _set_mcp_enabled(name, True)
-
-
-@mcp_app.command("disable")
-def mcp_disable(name: str) -> None:
-    """Disable a global MCP server."""
-    _set_mcp_enabled(name, False)
-
-
-@mcp_app.command("trust")
-def mcp_trust(name: str) -> None:
-    """Trust the current project's configured stdio command."""
-    result = load_mcp_config(Path.cwd())
-    server = result.servers.get(name)
-    if server is None or server.source != "project" or server.transport != "stdio":
-        raise typer.BadParameter("Trust applies only to project stdio MCP servers.")
-    McpTrustStore().trust(Path.cwd(), server)
-    console.print(f"Trusted project MCP server {name} for this configuration.")
-
-
-async def _inspect_mcp(name: str, *, show_tools: bool) -> None:
-    renderer = CliRenderer(console)
-    manager = McpManager(cwd=Path.cwd(), confirm=renderer.confirm)
-    try:
-        await manager.ensure_connected({name})
-        status = next((item for item in manager.status() if item.name == name), None)
-        if status is None:
-            raise typer.BadParameter(f"MCP server not found: {name}")
-        if status.state not in {"connected", "degraded"}:
-            console.print(f"[red]{name}: {status.state}[/red] {status.error}")
-            raise typer.Exit(1)
-        console.print(f"[green]{name}: connected[/green] ({status.tool_count} tools)")
-        if show_tools:
-            table = Table("Tool", "Confirmation", "Description")
-            prefix = f"mcp__{name}__"
-            for tool in manager.tools():
-                if tool.name.startswith(prefix):
-                    table.add_row(
-                        tool.name, str(tool.requires_confirmation), tool.description
-                    )
-            console.print(table)
-    finally:
-        await manager.close()
-
-
-@mcp_app.command("test")
-def mcp_test(name: str) -> None:
-    """Connect to and test an MCP server."""
-    asyncio.run(_inspect_mcp(name, show_tools=False))
-
-
-@mcp_app.command("tools")
-def mcp_tools(name: str) -> None:
-    """Connect and list tools discovered from an MCP server."""
-    asyncio.run(_inspect_mcp(name, show_tools=True))
-
-
-@sandbox_app.command("status")
-def sandbox_status() -> None:
-    """Show sandbox status for the current workspace."""
-    asyncio.run(_print_sandbox_status())
-
-
-@sandbox_app.command("init")
-def sandbox_init() -> None:
-    """Create or start the configured sandbox for the current workspace."""
-    asyncio.run(_sandbox_init())
-
-
-@sandbox_app.command("exec")
-def sandbox_exec(
-    command: Annotated[
-        str, typer.Argument(help="Command to run inside the configured sandbox.")
-    ],
-) -> None:
-    """Run one command through the configured sandbox."""
-    asyncio.run(_sandbox_exec(command))
-
-
-@sandbox_app.command("stop")
-def sandbox_stop() -> None:
-    """Stop the current workspace sandbox when supported by the backend."""
-    asyncio.run(_sandbox_stop())
-
-
-@memory_app.command("status")
-def memory_status() -> None:
-    """Show memory distillation status."""
-    config = load_config()
-    _print_memory_status(
-        create_memory_store(config, workspace=Path.cwd()), enabled=config.memory_enabled
-    )
-
-
-@memory_app.command("enable")
-def memory_enable() -> None:
-    """Enable long-term memory."""
-    config = load_config()
-    config.memory_enabled = True
-    save_config(config)
-    console.print("[green]Long-term memory enabled.[/green]")
-
-
-@memory_app.command("disable")
-def memory_disable() -> None:
-    """Disable long-term memory."""
-    config = load_config()
-    config.memory_enabled = False
-    save_config(config)
-    console.print("[yellow]Long-term memory disabled.[/yellow]")
-
-
-@memory_app.command("distill")
-def memory_distill(
-    scope: Annotated[
-        str,
-        typer.Option(
-            "--scope",
-            help="Target scope: project, global (USER.md + MEMORY.md), or all.",
-        ),
-    ] = "all",
-) -> None:
-    """Distill this workspace's history summaries into long-term memory."""
-    config = load_config()
-    store = create_memory_store(config, workspace=Path.cwd())
-    if not config.memory_enabled:
-        console.print(
-            "[yellow]Long-term memory is disabled. Run `spice memory enable` first.[/yellow]"
-        )
-        raise typer.Exit(1)
-    allowed_targets = {
-        "project": {"project"},
-        "global": {"user", "memory"},
-        "all": {"user", "memory", "project"},
-    }.get(scope.lower())
-    if allowed_targets is None:
-        console.print(
-            "[bold red]Error:[/bold red] --scope must be project, global, or all."
-        )
-        raise typer.Exit(2)
-    registry = ModelRegistry()
-    resolved = find_initial_model(registry, config)
-    if not resolved.model:
-        console.print(
-            f"[bold red]Error:[/bold red] {resolved.message or 'No model configured.'}"
-        )
-        raise typer.Exit(1)
-    model = resolved.model
-    options = ModelRequestOptions(
-        api_key=get_api_key(model.provider, env_names=model.api_key_envs),
-        temperature=config.temperature,
-        max_tokens=model.output_tokens,
-        base_url=config.base_url or model.base_url,
-    )
-    try:
-        result = asyncio.run(
-            MemoryDistiller(
-                store, model=model, options=options, allowed_targets=allowed_targets
-            ).run()
-        )
-    except Exception as exc:
-        console.print(f"[bold red]Memory distillation failed:[/bold red] {exc}")
-        raise typer.Exit(1) from exc
-    if result.get("success") is False:
-        console.print(
-            f"[bold red]Memory distillation failed:[/bold red] {result.get('message', 'Plan could not be fully applied.')}"
-        )
-        raise typer.Exit(1)
-    if result.get("processed", 0) == 0:
-        console.print(result.get("message", "No unprocessed memory history."))
-        return
-    console.print(
-        f"[green]Memory distillation processed[/green] {result.get('processed')} entries "
-        f"(cursor {result.get('from_cursor')}..{result.get('to_cursor')})."
-    )
-    console.print(
-        f"adds={result.get('adds', 0)} replacements={result.get('replacements', 0)} "
-        f"removals={result.get('removals', 0)} skipped={result.get('skipped', 0)}"
-    )
-    raw_cleanup = result.get("cleanup")
-    cleanup = raw_cleanup if isinstance(raw_cleanup, dict) else {}
-    if cleanup.get("removed"):
-        console.print(f"history cleanup removed {cleanup.get('removed')} entries.")
-
-
-def _print_memory_status(store: MemoryStore, *, enabled: bool) -> None:
-    status = store.status()
-    table = Table("Metric", "Value")
-    table.add_row("enabled", str(enabled).lower())
-    table.add_row(
-        "history entries", f"{status['history_count']}/{status['history_limit']}"
-    )
-    table.add_row("processed cursor", str(status["processed_cursor"]))
-    table.add_row("unprocessed entries", str(status["unprocessed_count"]))
-    table.add_row("next distill batch", str(status["next_distill_batch"]))
-    table.add_row("USER.md usage", str(status["user_usage"]))
-    table.add_row("MEMORY.md usage", str(status["memory_usage"]))
-    table.add_row("project MEMORY.md usage", str(status.get("project_usage") or "n/a"))
-    table.add_row("workspace", str(status.get("workspace") or "n/a"))
     console.print(table)
 
 
@@ -625,62 +391,6 @@ def trace_inspect(
     except (OSError, json.JSONDecodeError, TraceInspectionError) as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from exc
-
-
-@skills_app.command("list")
-def skills_list() -> None:
-    """List available skills."""
-    result = load_skills(cwd=Path.cwd())
-    if not result.skills:
-        console.print("No skills found.")
-        return
-    table = Table("Name", "Source", "Priority", "Triggers", "Always", "Description")
-    for skill in result.skills:
-        table.add_row(
-            skill.name,
-            skill.source,
-            str(skill.priority),
-            ", ".join(skill.triggers),
-            "yes" if skill.always else "",
-            skill.description,
-        )
-    console.print(table)
-
-
-@skills_app.command("view")
-def skills_view(
-    name: Annotated[str, typer.Argument(help="Skill name.")],
-    file_path: Annotated[
-        str | None,
-        typer.Option(
-            "--file", "-f", help="Linked file path inside the skill directory."
-        ),
-    ] = None,
-) -> None:
-    """Show a skill SKILL.md or linked file."""
-    try:
-        console.print(read_skill_content(name, file_path, cwd=Path.cwd()))
-    except ValueError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
-        raise typer.Exit(1) from exc
-
-
-@skills_app.command("doctor")
-def skills_doctor() -> None:
-    """Show skill loading diagnostics."""
-    result = load_skills(cwd=Path.cwd())
-    if not result.diagnostics:
-        console.print("[green]No skill diagnostics.[/green]")
-        return
-    table = Table("Type", "Name", "Path", "Message")
-    for diagnostic in result.diagnostics:
-        table.add_row(
-            diagnostic.type,
-            diagnostic.name or "",
-            str(diagnostic.path),
-            diagnostic.message,
-        )
-    console.print(table)
 
 
 @app.command()
@@ -958,9 +668,7 @@ def storage_init(
             f"[bold red]Error:[/bold red] unsupported storage backend: {selected_backend}"
         )
         raise typer.Exit(1)
-    sqlite_path = Path(
-        str(config.storage.get("sqlitePath") or "~/.spice/spice.db")
-    ).expanduser()
+    sqlite_path = configured_sqlite_path(config)
     init_sqlite_database(sqlite_path)
     console.print(f"[green]Initialized SQLite storage:[/green] {sqlite_path}")
 
@@ -1263,7 +971,7 @@ def config_get(key: str) -> None:
         console.print(config.storage.get("backend", "file"))
         return
     if key in {"storage.sqlitePath", "storage.sqlite_path", "storage_sqlite_path"}:
-        console.print(config.storage.get("sqlitePath", "~/.spice/spice.db"))
+        console.print(configured_sqlite_path(config))
         return
     if key in {"tools.max_concurrency", "tools_max_concurrency"}:
         console.print(config.tools.get("max_concurrency", 4))
@@ -1289,75 +997,6 @@ def config_get(key: str) -> None:
     if not hasattr(config, key):
         raise typer.BadParameter(f"Unknown config key: {key}")
     console.print(getattr(config, key))
-
-
-async def _print_sandbox_status() -> None:
-    config = load_config()
-    workspace = create_workspace_policy(config.sandbox, cwd=Path.cwd())
-    environment = create_environment(config.sandbox, cwd=Path.cwd())
-    settings = config.sandbox if isinstance(config.sandbox, dict) else {}
-    mode = str(settings.get("mode") or "workspace")
-    table = Table("Field", "Value")
-    table.add_row("Mode", mode)
-    table.add_row(
-        "Environment", getattr(environment, "name", type(environment).__name__)
-    )
-    table.add_row("Workspace", str(workspace.root))
-    table.add_row("Restrict workspace", str(workspace.restrict))
-    from spice.sandbox.docker import DockerEnvironment
-
-    if isinstance(environment, DockerEnvironment):
-        try:
-            status = await environment.status()
-        except Exception as exc:
-            table.add_row("Backend status", f"error: {exc}")
-        else:
-            for key, value in status.items():
-                table.add_row(str(key), str(value))
-    console.print(table)
-
-
-async def _sandbox_init() -> None:
-    environment = create_environment(load_config().sandbox, cwd=Path.cwd())
-    try:
-        await environment.ensure_ready()
-    except Exception as exc:
-        console.print(f"[bold red]Sandbox init failed:[/bold red] {exc}")
-        raise typer.Exit(1) from exc
-    console.print("[green]Sandbox ready.[/green]")
-    await _print_sandbox_status()
-
-
-async def _sandbox_exec(command: str) -> None:
-    config = load_config()
-    workspace = create_workspace_policy(config.sandbox, cwd=Path.cwd())
-    environment = create_environment(config.sandbox, cwd=Path.cwd())
-    try:
-        cwd = workspace.resolve_exec_cwd(".")
-        result = await environment.run(command, cwd=cwd, timeout=600)
-    except Exception as exc:
-        console.print(f"[bold red]Sandbox exec failed:[/bold red] {exc}")
-        raise typer.Exit(1) from exc
-    if result.output:
-        console.print(result.output.rstrip())
-    if result.exit_code:
-        raise typer.Exit(result.exit_code)
-
-
-async def _sandbox_stop() -> None:
-    environment = create_environment(load_config().sandbox, cwd=Path.cwd())
-    stop = getattr(environment, "stop", None)
-    if stop is None:
-        console.print(
-            f"[yellow]Sandbox environment does not support stop:[/yellow] {getattr(environment, 'name', type(environment).__name__)}"
-        )
-        return
-    try:
-        await stop()
-    except Exception as exc:
-        console.print(f"[bold red]Sandbox stop failed:[/bold red] {exc}")
-        raise typer.Exit(1) from exc
-    console.print("[green]Sandbox stopped.[/green]")
 
 
 def _parse_bool(value: str) -> bool:

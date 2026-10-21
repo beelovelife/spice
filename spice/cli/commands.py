@@ -197,7 +197,7 @@ class SlashCommandRegistry:
             raw=raw_message,
             args="",
             confirm_policy=policy,
-            extras={"extension_context": context},
+            extras={"extension_context": context, "last_reasoning": lambda: context.renderer.last_reasoning},
         )
         result = await self._core.execute(raw_message, command_ctx)
 
@@ -490,23 +490,27 @@ def _plain_text(value: object) -> str:
 
 def _print_session_history(console: Console, messages: list) -> None:
     """Render session messages like a live conversation replay."""
+    from spice.agent.session_history import HistoryError
     from spice.agent.tool_results import tool_display_text
 
     if not messages:
         return
     console.print()
     for message in messages:
+        if isinstance(message, HistoryError):
+            console.print(message.display_text, style="red", markup=False)
+            console.print()
+            continue
         if message.role == "system":
             continue
         if message.role == "user":
             content = (message.content or "").strip()
             if content:
-                console.print(f"[bold green]You:[/bold green] {content}")
+                console.print(f"[bold cyan]>[/bold cyan] {content}")
                 console.print()
         elif message.role == "assistant":
             content = (message.content or "").strip()
             if content:
-                console.print("[bold cyan]Spice:[/bold cyan] ", end="")
                 _render_history_markdown(console, content)
                 console.print()
             if message.tool_calls:

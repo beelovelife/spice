@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+
+from spice.async_utils import closing_iterator
 
 from spice.llm.messages import Message
 from spice.llm.models import Model
 from spice.llm.retry import ModelRetryPolicy, stream_with_retry
 from spice.llm.stream import stream_model
+from spice.llm.usage import track_model_stream
 from spice.llm.types import (
     Done,
     ModelFallbackNotice,
@@ -33,6 +36,9 @@ class ModelCandidate:
     options: ModelRequestOptions
 
 
+BeforeModelRequest = Callable[[ModelCandidate, list[Message], list[ToolSchema]], Awaitable[None]]
+
+
 class ModelRoute:
     def __init__(
         self,
@@ -41,6 +47,7 @@ class ModelRoute:
         retry_policy: ModelRetryPolicy,
         fallback_enabled: bool,
         stream_factory: StreamFactory = stream_model,
+        usage_source: str = "main",
     ) -> None:
         if not candidates:
             raise ValueError("ModelRoute requires at least one candidate.")
@@ -48,6 +55,7 @@ class ModelRoute:
         self.retry_policy = retry_policy
         self.fallback_enabled = fallback_enabled
         self.stream_factory = stream_factory
+        self.usage_source = usage_source
         self.active_index: int | None = None
         self.committed = False
 
@@ -55,35 +63,46 @@ class ModelRoute:
     def actual(self) -> ModelCandidate:
         return self.candidates[self.active_index or 0]
 
-    async def stream(self, messages: list[Message], tools: list[ToolSchema]) -> AsyncIterator[StreamEvent]:
+    async def stream(
+        self, messages: list[Message], tools: list[ToolSchema], *,
+        before_request: BeforeModelRequest | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         indexes = [self.active_index] if self.active_index is not None else list(range(len(self.candidates)))
         for position, candidate_index in enumerate(indexes):
             assert candidate_index is not None
             candidate = self.candidates[candidate_index]
+            if before_request is not None:
+                await before_request(candidate, messages, tools)
             failure: StreamError | None = None
 
             async def create_stream() -> AsyncIterator[StreamEvent]:
-                async for item in self.stream_factory(candidate.model, messages, tools, candidate.options):
-                    yield item
+                async with closing_iterator(track_model_stream(
+                    candidate.model,
+                    lambda: self.stream_factory(candidate.model, messages, tools, candidate.options),
+                    source=self.usage_source,
+                )) as stream:
+                    async for item in stream:
+                        yield item
 
-            async for event in stream_with_retry(
+            async with closing_iterator(stream_with_retry(
                 create_stream,
                 policy=self.retry_policy,
                 provider=candidate.model.provider,
                 model=candidate.model.id,
-            ):
-                if isinstance(event, (TextDelta, ToolCallEvent)):
-                    self.active_index = candidate_index
-                    self.committed = True
-                    yield event
-                elif isinstance(event, Done):
-                    self.active_index = candidate_index
-                    yield event
-                    return
-                elif isinstance(event, StreamError):
-                    failure = event
-                else:
-                    yield event
+            )) as stream:
+                async for event in stream:
+                    if isinstance(event, (TextDelta, ToolCallEvent)):
+                        self.active_index = candidate_index
+                        self.committed = True
+                        yield event
+                    elif isinstance(event, Done):
+                        self.active_index = candidate_index
+                        yield event
+                        return
+                    elif isinstance(event, StreamError):
+                        failure = event
+                    else:
+                        yield event
 
             if failure is None:
                 return
@@ -120,6 +139,7 @@ def build_model_route(
     routing_settings: dict,
     resolve_model: Callable[[str], Model | None],
     options_factory: Callable[[Model], ModelRequestOptions],
+    usage_source: str = "main",
 ) -> ModelRoute:
     retry_policy = ModelRetryPolicy.from_settings(routing_settings.get("retry"))
     raw_fallback = routing_settings.get("fallback")
@@ -138,4 +158,4 @@ def build_model_route(
         ModelCandidate(model.profile_key or model.id, model, options_factory(model))
         for model in models
     ]
-    return ModelRoute(candidates, retry_policy=retry_policy, fallback_enabled=fallback_enabled)
+    return ModelRoute(candidates, retry_policy=retry_policy, fallback_enabled=fallback_enabled, usage_source=usage_source)

@@ -17,6 +17,7 @@ BUILTIN_MODELS = [
         context_window=128000,
         output_tokens=4096,
         protocol="openai-responses",
+        supports_vision=True,
         api_key_envs=["OPENAI_API_KEY"],
     ),
     Model(
@@ -25,6 +26,7 @@ BUILTIN_MODELS = [
         context_window=128000,
         output_tokens=4096,
         protocol="openai-responses",
+        supports_vision=True,
         api_key_envs=["OPENAI_API_KEY"],
     ),
     Model(
@@ -34,22 +36,26 @@ BUILTIN_MODELS = [
         output_tokens=8192,
         supports_reasoning=True,
         protocol="openai-responses",
+        supports_vision=True,
         api_key_envs=["OPENAI_API_KEY"],
     ),
     Model(
-        id="deepseek-v4-flash",
+        id="deepseek-flash",
         provider="deepseek",
+        name="DeepSeek V4.1 Flash",
         context_window=1000000,
         output_tokens=60000,
+        supports_vision=True,
         supports_reasoning=True,
         protocol="openai-responses",
         base_url="https://api.deepseek.com",
         api_key_envs=["DEEPSEEK_API_KEY"],
         provider_name="DeepSeek",
         pricing=ModelPricing(
-            input_per_million_usd="0.14",
-            output_per_million_usd="0.28",
-            cache_read_per_million_usd="0.0028",
+            # Peak-hour rates for estimates; actual off-peak billing is lower.
+            input_per_million_usd="0.3",
+            output_per_million_usd="1.2",
+            cache_read_per_million_usd="0.006",
         ),
     ),
     Model(
@@ -74,6 +80,7 @@ BUILTIN_MODELS = [
         context_window=200000,
         output_tokens=64000,
         protocol="anthropic-messages",
+        supports_vision=True,
         api_key_envs=["ANTHROPIC_API_KEY"],
     ),
     Model(
@@ -82,6 +89,7 @@ BUILTIN_MODELS = [
         context_window=1000000,
         output_tokens=128000,
         protocol="anthropic-messages",
+        supports_vision=True,
         api_key_envs=["ANTHROPIC_API_KEY"],
     ),
     Model(
@@ -90,6 +98,7 @@ BUILTIN_MODELS = [
         context_window=1000000,
         output_tokens=128000,
         protocol="anthropic-messages",
+        supports_vision=True,
         api_key_envs=["ANTHROPIC_API_KEY"],
     ),
     Model(
@@ -98,6 +107,7 @@ BUILTIN_MODELS = [
         context_window=1000000,
         output_tokens=8192,
         protocol="google-generative-ai",
+        supports_vision=True,
         api_key_envs=["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     ),
     Model(
@@ -106,6 +116,7 @@ BUILTIN_MODELS = [
         context_window=1000000,
         output_tokens=8192,
         protocol="google-generative-ai",
+        supports_vision=True,
         api_key_envs=["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     ),
 ]
@@ -142,13 +153,24 @@ class ModelRegistry:
         if model_id in self._model_profiles:
             return self._model_profiles[model_id]
         if "/" in model_id:
-            return self._models.get(model_id)
+            return self._find_registered(model_id)
         if provider:
-            found = self._models.get(f"{provider}/{model_id}")
+            found = self._find_registered(f"{provider}/{model_id}")
             if found:
                 return found
         matches = [m for m in self._models.values() if m.id == model_id]
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0]
+        if not matches and model_id == "deepseek-v4-flash":
+            return self._find_registered(f"deepseek/{model_id}")
+        return None
+
+    def _find_registered(self, key: str) -> Model | None:
+        model = self._models.get(key)
+        if model is None and key == "deepseek/deepseek-v4-flash":
+            # Resolve saved V4 Flash selections without listing a duplicate model.
+            return self._models.get("deepseek/deepseek-flash")
+        return model
 
     def _load_custom_models(self, path: Path) -> None:
         if not path.exists():

@@ -8,7 +8,10 @@ from spice.agent.events import (
     RoundCompleteEvent,
     ToolExecutionEndEvent,
     TurnStartEvent,
+    TurnEndEvent,
+    TurnFinalizationStartEvent,
 )
+from spice.agent.turn_outcome import TurnCheckpoint
 from spice.extensions.manager import ExtensionEvent
 from spice.tools.base import tool_result
 
@@ -91,6 +94,22 @@ def test_round_complete_is_forwarded_to_extensions() -> None:
     assert asyncio.run(run()) == [("round_complete", {"round_index": 2})]
 
 
+def test_pause_and_checkpoint_are_shared_with_extension_observers():
+    async def run():
+        extensions = FakeExtensions()
+        dispatcher = AgentEventDispatcher(extensions)
+        await dispatcher.dispatch(TurnFinalizationStartEvent(100, 100))
+        checkpoint = TurnCheckpoint("task", 100, 100, summary="继续验收")
+        await dispatcher.dispatch(TurnEndEvent(checkpoint.summary, "max_tool_rounds", checkpoint=checkpoint))
+        return extensions.seen
+
+    seen = asyncio.run(run())
+    assert seen[0] == ("turn_finalization_start", {"rounds_used": 100, "round_limit": 100})
+    assert seen[1][0] == "turn_end"
+    assert seen[1][1]["status"] == "paused"
+    assert seen[1][1]["checkpoint"]["summary"] == "继续验收"
+
+
 def test_reasoning_delta_is_forwarded_to_extensions() -> None:
     async def run():
         extensions = FakeExtensions()
@@ -101,3 +120,21 @@ def test_reasoning_delta_is_forwarded_to_extensions() -> None:
     assert asyncio.run(run()) == [
         ("reasoning_delta", {"text": "checking", "kind": "summary"})
     ]
+
+
+def test_extension_observer_failure_does_not_hide_events_from_frontends():
+    class BrokenObserver:
+        async def emit(self, *_args):
+            raise RuntimeError("observer failed: api_key=private-value")
+
+    async def run():
+        dispatcher = AgentEventDispatcher(BrokenObserver())
+        seen = []
+        dispatcher.subscribe(seen.append)
+        event = TurnStartEvent("run")
+        await dispatcher.dispatch(event)
+        assert seen == [event]
+        assert len(dispatcher.listener_errors) == 1
+        assert "private-value" not in dispatcher.listener_errors[0]
+
+    asyncio.run(run())

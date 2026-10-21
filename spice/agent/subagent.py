@@ -9,15 +9,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
+from spice.async_utils import closing_iterator
+
 from spice.agent.events import AgentErrorEvent, AssistantMessageEvent, TurnEndEvent
 from spice.agent.prompts import build_system_prompt
-from spice.llm.config import get_api_key, load_config
+from spice.llm.config import SpiceConfig, get_api_key, load_config
 from spice.llm.messages import Message
 from spice.llm.model_registry import ModelRegistry
 from spice.llm.models import Model
 from spice.llm.routing import build_model_route
 from spice.llm.types import ModelRequestOptions
 from spice.sandbox.factory import create_environment, create_workspace_policy
+from spice.sandbox.base import ExecutionEnvironment
+from spice.sandbox.policy import WorkspacePolicy
 from spice.tools.base import ConfirmFn, Tool, truncate_tail
 from spice.tools.file_state import FileStateStore
 
@@ -29,8 +33,9 @@ SUBAGENT_RESULT_CHARS = 50_000
 async def run_turn(**kwargs):
     from spice.agent.loop import run_turn as agent_run_turn
 
-    async for event in agent_run_turn(**kwargs):
-        yield event
+    async with closing_iterator(agent_run_turn(**kwargs)) as events:
+        async for event in events:
+            yield event
 
 
 @dataclass(slots=True)
@@ -118,18 +123,23 @@ class SubagentManager:
         max_concurrent: int = MAX_CONCURRENT_SUBAGENTS,
         max_tool_rounds: int = SUBAGENT_MAX_TOOL_ROUNDS,
         result_chars: int = SUBAGENT_RESULT_CHARS,
+        config: SpiceConfig | None = None,
+        workspace: WorkspacePolicy | None = None,
+        environment: ExecutionEnvironment | None = None,
+        model_registry: ModelRegistry | None = None,
     ) -> None:
         self.cwd = cwd
         self.model = model
         self.options_factory = options_factory
         self.confirm = confirm
         self.tools_factory = tools_factory
-        self.max_concurrent = max_concurrent
+        self.max_concurrent = max(1, min(max_concurrent, MAX_CONCURRENT_SUBAGENTS))
         self.max_tool_rounds = max_tool_rounds
         self.result_chars = result_chars
-        self.config = load_config()
-        self.workspace_policy = create_workspace_policy(self.config.sandbox, cwd=self.cwd)
-        self.environment = create_environment(self.config.sandbox, cwd=self.cwd)
+        self.config = config if config is not None else load_config()
+        self.workspace_policy = workspace or create_workspace_policy(self.config.sandbox, cwd=self.cwd)
+        self.environment = environment or create_environment(self.config.sandbox, cwd=self.cwd)
+        self.registry = model_registry or ModelRegistry()
 
     def set_model(self, model: Model) -> None:
         self.model = model
@@ -141,8 +151,15 @@ class SubagentManager:
             async with semaphore:
                 return await self.run_one(task, index=index)
 
-        results = await asyncio.gather(*(run_limited(task, index) for index, task in enumerate(tasks)))
-        return SubagentRunSummary(results=list(results))
+        workers = [asyncio.create_task(run_limited(task, index)) for index, task in enumerate(tasks)]
+        try:
+            results = await asyncio.gather(*workers)
+            return SubagentRunSummary(results=list(results))
+        finally:
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
     async def run_one(self, task: SubagentTask, *, index: int = 0) -> SubagentResult:
         task_id = uuid4().hex[:8]
@@ -156,10 +173,12 @@ class SubagentManager:
         route = build_model_route(
             self.model,
             routing_settings=self.config.model_routing,
-            resolve_model=lambda profile: ModelRegistry().find(None, profile),
+            resolve_model=lambda profile: self.registry.find(None, profile),
             options_factory=self._options_for_model,
+            usage_source="subagent",
         )
 
+        outcome_status = "completed"
         try:
             async for event in run_turn(
                 prompt=task.task,
@@ -184,13 +203,16 @@ class SubagentManager:
                         final_text = event.text
                 elif isinstance(event, TurnEndEvent):
                     final_text = event.text
+                    outcome_status = event.status
                 elif isinstance(event, AgentErrorEvent):
                     error = event.message
         except Exception as exc:
             error = str(exc)
 
         duration_ms = int((time.perf_counter() - started) * 1000)
-        status = "error" if error else "ok"
+        status = "error" if error or outcome_status == "failed" else (
+            outcome_status if outcome_status in {"paused", "interrupted"} else "ok"
+        )
         raw_result = error or final_text or "Task completed but no final response was generated."
         result_text, truncated, original_chars = _truncate_subagent_result(raw_result, self.result_chars)
         return SubagentResult(
@@ -211,7 +233,7 @@ class SubagentManager:
         return [
             tool
             for tool in self.tools_factory()
-            if tool.name not in {"spawn_subagents", "update_todo"}
+            if tool.name not in {"spawn_subagents", "update_todo", "complete_long_task"}
         ]
 
     def _options_for_model(self, model: Model) -> ModelRequestOptions:

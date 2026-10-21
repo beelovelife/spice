@@ -11,7 +11,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_DIR = Path(os.environ.get("SPICE_CONFIG_DIR", Path.home() / ".spice")).expanduser()
+CONFIG_DIR = Path(
+    os.environ.get("SPICE_CONFIG_DIR", Path.home() / ".spice")
+).expanduser()
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 SECRETS_PATH = CONFIG_DIR / "secrets.json"
 logger = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ DEFAULT_SANDBOX_CONFIG: dict[str, Any] = {
 
 DEFAULT_STORAGE_CONFIG: dict[str, Any] = {
     "backend": "file",
-    "sqlitePath": "~/.spice/spice.db",
+    "sqlitePath": str(CONFIG_DIR / "spice.db"),
 }
 
 DEFAULT_TOOLS_CONFIG: dict[str, Any] = {
@@ -103,10 +105,18 @@ class SpiceConfig:
     subagents_enabled: bool = True
     max_concurrent_subagents: int = 3
     logging_retention_days: int = 7
-    sandbox: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_SANDBOX_CONFIG))
-    storage: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_STORAGE_CONFIG))
-    tools: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_TOOLS_CONFIG))
-    model_routing: dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_MODEL_ROUTING_CONFIG))
+    sandbox: dict[str, Any] = field(
+        default_factory=lambda: copy.deepcopy(DEFAULT_SANDBOX_CONFIG)
+    )
+    storage: dict[str, Any] = field(
+        default_factory=lambda: copy.deepcopy(DEFAULT_STORAGE_CONFIG)
+    )
+    tools: dict[str, Any] = field(
+        default_factory=lambda: copy.deepcopy(DEFAULT_TOOLS_CONFIG)
+    )
+    model_routing: dict[str, Any] = field(
+        default_factory=lambda: copy.deepcopy(DEFAULT_MODEL_ROUTING_CONFIG)
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -127,7 +137,9 @@ def _read_json(path: Path) -> dict[str, Any]:
         logger.warning("config_read_failed path=%s error=%s", path, exc)
         return {}
     if not isinstance(data, dict):
-        logger.warning("config_json_ignored path=%s reason=top-level value is not an object", path)
+        logger.warning(
+            "config_json_ignored path=%s reason=top-level value is not an object", path
+        )
         return {}
     return data
 
@@ -145,9 +157,16 @@ def _ensure_private_file(path: Path, *, label: str) -> None:
     try:
         os.chmod(path, 0o600)
     except OSError as exc:
-        logger.warning("%s_permission_fix_failed path=%s mode=%o error=%s", label, path, mode, exc)
+        logger.warning(
+            "%s_permission_fix_failed path=%s mode=%o error=%s", label, path, mode, exc
+        )
         return
-    logger.warning("%s_permissions_restricted path=%s previous_mode=%o new_mode=600", label, path, mode)
+    logger.warning(
+        "%s_permissions_restricted path=%s previous_mode=%o new_mode=600",
+        label,
+        path,
+        mode,
+    )
 
 
 def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
@@ -182,7 +201,9 @@ def save_config(config: SpiceConfig) -> None:
     model_profiles = copy.deepcopy(config.model_profiles)
     profile_key = config.default_model or config.model
     existing_profile = model_profiles.get(profile_key)
-    profile = copy.deepcopy(existing_profile) if isinstance(existing_profile, dict) else {}
+    profile = (
+        copy.deepcopy(existing_profile) if isinstance(existing_profile, dict) else {}
+    )
     profile["provider"] = config.provider
     profile["model"] = config.model
     if config.base_url is not None:
@@ -263,11 +284,25 @@ def _config_values_from_settings(data: dict[str, Any]) -> dict[str, Any]:
         if "enabled" in memory_settings:
             values["memory_enabled"] = bool(memory_settings.get("enabled"))
         for field_name, keys, default in (
-            ("memory_user_char_limit", ("userCharLimit", "user_char_limit"), SpiceConfig.memory_user_char_limit),
-            ("memory_global_char_limit", ("globalCharLimit", "global_char_limit"), SpiceConfig.memory_global_char_limit),
-            ("memory_project_char_limit", ("projectCharLimit", "project_char_limit"), SpiceConfig.memory_project_char_limit),
+            (
+                "memory_user_char_limit",
+                ("userCharLimit", "user_char_limit"),
+                SpiceConfig.memory_user_char_limit,
+            ),
+            (
+                "memory_global_char_limit",
+                ("globalCharLimit", "global_char_limit"),
+                SpiceConfig.memory_global_char_limit,
+            ),
+            (
+                "memory_project_char_limit",
+                ("projectCharLimit", "project_char_limit"),
+                SpiceConfig.memory_project_char_limit,
+            ),
         ):
-            raw = next((memory_settings[key] for key in keys if key in memory_settings), None)
+            raw = next(
+                (memory_settings[key] for key in keys if key in memory_settings), None
+            )
             if raw is not None:
                 try:
                     values[field_name] = max(1, int(raw))
@@ -313,7 +348,15 @@ def _config_values_from_settings(data: dict[str, Any]) -> dict[str, Any]:
     for key, value in data.items():
         if key not in SpiceConfig.__dataclass_fields__:
             continue
-        if key in {"sandbox", "storage", "tools", "model_routing", "model_profiles", "models", "defaultModel"}:
+        if key in {
+            "sandbox",
+            "storage",
+            "tools",
+            "model_routing",
+            "model_profiles",
+            "models",
+            "defaultModel",
+        }:
             continue
         if key == "model" and not isinstance(value, str):
             continue
@@ -335,12 +378,21 @@ def _normalize_storage_config(settings: dict[str, Any]) -> dict[str, Any]:
 def _normalize_tools_config(settings: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(DEFAULT_TOOLS_CONFIG)
     try:
-        result["max_concurrency"] = min(max(int(settings.get("max_concurrency", result["max_concurrency"])), 1), 16)
+        result["max_concurrency"] = min(
+            max(int(settings.get("max_concurrency", result["max_concurrency"])), 1), 16
+        )
     except (TypeError, ValueError):
         pass
     try:
         result["default_timeout_seconds"] = min(
-            max(float(settings.get("default_timeout_seconds", result["default_timeout_seconds"])), 1.0),
+            max(
+                float(
+                    settings.get(
+                        "default_timeout_seconds", result["default_timeout_seconds"]
+                    )
+                ),
+                1.0,
+            ),
             3600.0,
         )
     except (TypeError, ValueError):
@@ -373,7 +425,11 @@ def _normalize_model_routing_config(settings: dict[str, Any]) -> dict[str, Any]:
     fallback = result["fallback"]
     fallback["enabled"] = bool(fallback.get("enabled", False))
     profiles = fallback.get("profiles")
-    fallback["profiles"] = [str(item) for item in profiles[:3] if str(item).strip()] if isinstance(profiles, list) else []
+    fallback["profiles"] = (
+        [str(item) for item in profiles[:3] if str(item).strip()]
+        if isinstance(profiles, list)
+        else []
+    )
     fallback["resetOnNextTurn"] = bool(fallback.get("resetOnNextTurn", True))
     return result
 

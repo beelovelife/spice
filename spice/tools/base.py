@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from spice.llm.messages import ImageContent
+
 if TYPE_CHECKING:
     from spice.agent.subagent import SubagentManager
     from spice.sandbox.base import ExecutionEnvironment
@@ -27,6 +29,7 @@ class ToolResult:
     disposition: ToolFailureDisposition = "recoverable"
     error_code: str | None = None
     full_content: str | None = field(default=None, repr=False)
+    images: list[ImageContent] = field(default_factory=list)
 
 
 @dataclass
@@ -38,6 +41,7 @@ class ToolContext:
     emit_update: Callable[[str], Awaitable[None]] | None = None
     file_states: FileStateStore | None = None
     subagent_manager: SubagentManager | None = None
+    supports_vision: bool = False
 
 
 ToolExecuteFn = Callable[[dict[str, Any], ToolContext], Awaitable[ToolResult]]
@@ -262,8 +266,9 @@ def tool_result(
     details: dict[str, Any] | None = None,
     *,
     full_content: str | None = None,
+    images: list[ImageContent] | None = None,
 ) -> ToolResult:
-    return ToolResult(content=content, details=details or {}, full_content=full_content)
+    return ToolResult(content=content, details=details or {}, full_content=full_content, images=list(images or []))
 
 
 def tool_error(
@@ -272,8 +277,10 @@ def tool_error(
     *,
     code: str | None = None,
     full_content: str | None = None,
+    images: list[ImageContent] | None = None,
 ) -> ToolResult:
-    return ToolResult(content=content, is_error=True, details=details or {}, error_code=code, full_content=full_content)
+    return ToolResult(content=content, is_error=True, details=details or {}, error_code=code,
+                      full_content=full_content, images=list(images or []))
 
 
 def fatal_tool_error(

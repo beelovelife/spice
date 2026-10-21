@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from spice.llm.messages import ToolCall
 from spice.llm.usage import ModelUsageRecord
 from spice.tools.base import ToolResult
+from spice.agent.turn_outcome import TurnCheckpoint, TurnStatus, turn_status
 
 
 class AgentEvent:
@@ -100,9 +101,20 @@ class ModelFallbackEvent(AgentEvent):
 
 
 @dataclass
+class TurnFinalizationStartEvent(AgentEvent):
+    rounds_used: int
+    round_limit: int
+
+
+@dataclass
 class TurnEndEvent(AgentEvent):
     text: str
     stop_reason: str = "stop"
+    checkpoint: TurnCheckpoint | None = None
+    status: TurnStatus = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.status = turn_status(self.stop_reason)
 
 
 @dataclass

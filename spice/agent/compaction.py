@@ -6,10 +6,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from spice.llm.image_context import project_image_context
 from spice.llm.messages import Message
 from spice.llm.models import Model
+from spice.async_utils import closing_iterator
+from spice.llm.retry import ModelRetryPolicy, stream_with_retry
 from spice.llm.stream import stream_model
-from spice.llm.types import ModelRequestOptions, StreamError, TextDelta
+from spice.llm.types import ModelRequestOptions, StreamError, TextDelta, ToolSchema
+from spice.llm.usage import track_model_stream
 
 DEFAULT_RESERVE_TOKENS = 16_384
 DEFAULT_KEEP_RECENT_TOKENS = 20_000
@@ -70,9 +74,14 @@ def check_compaction_needed(
     messages: list[Message],
     model: Model,
     settings: CompactionSettings = CompactionSettings(),
+    *,
+    tools: list[ToolSchema] | None = None,
 ) -> CompactionCheck:
     reserve = effective_reserve_tokens(model, settings)
-    estimated = estimate_messages_tokens(messages)
+    estimated = estimate_messages_tokens(project_image_context(messages))
+    for tool in tools or []:
+        chars = len(tool.name) + len(tool.description) + len(_safe_json(tool.parameters))
+        estimated += (chars + 3) // 4
     if not settings.enabled:
         return CompactionCheck(estimated, None, reserve, False, "disabled")
     if model.context_window <= 0:
@@ -93,13 +102,15 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
 
 def estimate_message_tokens(message: Message) -> int:
     chars = len(message.role) + len(message.content or "")
+    chars += len(str(message.metadata.get("_reasoning_content") or ""))
     if message.name:
         chars += len(message.name)
     if message.tool_call_id:
         chars += len(message.tool_call_id)
     for call in message.tool_calls:
         chars += len(call.id) + len(call.name) + len(_safe_json(call.arguments))
-    return max(1, (chars + 3) // 4)
+    image_tokens = sum(256 + 2 * ((image.width + 31) // 32) * ((image.height + 31) // 32) for image in message.images)
+    return max(1, (chars + 3) // 4) + image_tokens
 
 
 def prepare_compaction(
@@ -191,11 +202,17 @@ async def generate_summary(
         Message(role="user", content=prompt),
     ]
     summary_parts: list[str] = []
-    async for event in stream_model(model, request_messages, [], options):
-        if isinstance(event, TextDelta):
-            summary_parts.append(event.text)
-        elif isinstance(event, StreamError):
-            raise CompactionError(event.error)
+    async with closing_iterator(stream_with_retry(
+        lambda: track_model_stream(
+            model, lambda: stream_model(model, request_messages, [], options), source="compaction",
+        ),
+        policy=ModelRetryPolicy(enabled=False), provider=model.provider, model=model.id,
+    )) as events:
+        async for event in events:
+            if isinstance(event, TextDelta):
+                summary_parts.append(event.text)
+            elif isinstance(event, StreamError):
+                raise CompactionError(event.error)
     summary = "".join(summary_parts).strip()
     if not summary:
         raise CompactionError("Compaction summary was empty.")
@@ -230,6 +247,8 @@ def _serialize_messages(messages: list[Message]) -> str:
     for message in messages:
         label = message.role if not message.name else f"{message.role}:{message.name}"
         chunks.append(f"[{label}]\n{message.content or ''}")
+        for image in message.images:
+            chunks.append(f"[image attachment: {image.source or 'embedded image'}, {image.width}x{image.height}; pixels omitted from summary input]")
         if message.tool_calls:
             calls = [
                 {"id": call.id, "name": call.name, "arguments": call.arguments}
