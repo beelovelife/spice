@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 import spice.agent.agent_session as session_module
+import spice.agent.loop as loop_module
+from spice.agent.compaction import CompactionError, check_compaction_needed
+from spice.agent.hooks import CompactionCompleted
+from spice.llm.types import Done, ReasoningDelta, TextDelta, ToolCallEvent
 from spice.agent.events import AgentErrorEvent, RoundCompleteEvent, TextDeltaEvent, TurnEndEvent
 from spice.agent.agent_session import AgentSession
 from spice.agent.sessions import SessionStore, message_from_dict, message_to_dict, workspace_key
@@ -15,7 +21,7 @@ from spice.llm.messages import Message, ToolCall
 from spice.llm.models import Model
 from spice.storage.sqlite import connect_sqlite, init_sqlite_database
 from spice.storage.sqlite_sessions import SqliteSessionStore
-from spice.tools.base import ToolContext, tool_result
+from spice.tools.base import Tool, ToolContext, tool_result
 
 
 async def _drain(events) -> None:
@@ -567,6 +573,8 @@ class AgentSessionPersistenceTests(unittest.TestCase):
         self.assertEqual(roles, ["user", "assistant", "tool"])
 
     def test_cancellation_persists_interrupted_tool_result(self) -> None:
+        started = asyncio.Event()
+
         async def fake_run_turn(**kwargs):
             kwargs["messages"].extend(
                 [
@@ -574,6 +582,7 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                     Message(role="assistant", content="", tool_calls=[ToolCall("tc1", "bash", {"command": "sleep 10"})]),
                 ]
             )
+            started.set()
             await asyncio.Event().wait()
             if False:
                 yield TurnEndEvent("")
@@ -590,8 +599,7 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                     return [event async for event in session.prompt("run")]
 
                 task = asyncio.create_task(consume())
-                await asyncio.sleep(0)
-                await asyncio.sleep(0)
+                await started.wait()
                 task.cancel()
                 events = await task
                 messages = store.load_messages(session.session_id)
@@ -760,6 +768,8 @@ class AgentSessionPersistenceTests(unittest.TestCase):
         self.assertIn("Referenced files:", persisted[0].content)
 
     def test_prompt_rejects_image_reference_when_model_lacks_vision(self) -> None:
+        from spice.agent.session_history import AGENT_ERROR_ENTRY
+
         called = False
 
         async def fake_run_turn(**kwargs):
@@ -775,16 +785,22 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 (root / "ui.png").write_bytes(b"\x89PNG\r\n\x1a\n")
                 store = SessionStore(root / "sessions", cwd=root)
                 session = AgentSession(cwd=root, session_store=store)
+                session.model = Model(id="text-only", provider="openai", supports_vision=False)
                 events = [event async for event in session.prompt("@ui.png analyze")]
-                return events, session
+                errors = [entry.data for entry in store.path_entries(session.session_id)
+                          if entry.data.get("customType") == AGENT_ERROR_ENTRY]
+                return events, session, store.load_messages(session.session_id), errors
 
 
-        events, session = asyncio.run(run())
+        events, session, messages, errors = asyncio.run(run())
 
         self.assertEqual([type(event).__name__ for event in events], ["AgentErrorEvent"])
         self.assertIn("does not support image input", events[0].message)
         self.assertFalse(called)
-        self.assertEqual(session.session_label, "new")
+        self.assertNotEqual(session.session_label, "new")
+        self.assertEqual([(message.role, message.content) for message in messages], [("user", "@ui.png analyze")])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["message"], events[0].message)
 
     def test_plan_mode_uses_read_only_tools_and_restores_from_session(self) -> None:
         seen_tools = []
@@ -940,10 +956,10 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 store = SessionStore(root / "sessions", cwd=root)
                 session = AgentSession(cwd=root, session_store=store)
 
-                def fail_persist_messages(_index: int) -> str | None:
+                def fail_append_message(*args, **kwargs) -> str:
                     raise OSError("disk full")
 
-                session._persist_messages_from = fail_persist_messages  # type: ignore[method-assign]
+                store.append_message = fail_append_message  # type: ignore[method-assign]
                 try:
                     await _drain(session.prompt("complex analysis"))
                 except OSError as exc:
@@ -1064,20 +1080,23 @@ class AgentSessionPersistenceTests(unittest.TestCase):
         self.assertNotIn("Disk latest todo", session.messages[0].content)
         self.assertNotIn("Keep going", session.messages[0].content)
 
-    def test_prompt_auto_compacts_before_running_turn(self) -> None:
+    def test_prompt_auto_compacts_before_model_request(self) -> None:
         seen_message_counts = []
         seen_system_prompts = []
 
         async def fake_generate_summary(**kwargs):
             return "Summarized old context."
 
-        async def fake_run_turn(**kwargs):
-            messages = kwargs["messages"]
+        async def fake_stream(model, messages, tools, options):
             seen_message_counts.append(len(messages))
             seen_system_prompts.append(messages[0].content)
-            messages.append(Message(role="user", content=kwargs["prompt"]))
-            messages.append(Message(role="assistant", content="done"))
-            yield TurnEndEvent("done")
+            yield TextDelta("done")
+            yield Done("stop")
+
+        async def fake_run_turn(**kwargs):
+            kwargs["model_route"].stream_factory = fake_stream
+            async for event in loop_module.run_turn(**kwargs):
+                yield event
 
         session_module.generate_summary = fake_generate_summary
         session_module.run_turn = fake_run_turn
@@ -1093,7 +1112,8 @@ class AgentSessionPersistenceTests(unittest.TestCase):
                 for index in range(12):
                     store.append_message(info.id, Message(role="user", content=f"old {index} " + ("x" * 10000)))
                 session = AgentSession(cwd=workspace, session_id=info.id, session_store=store)
-                session.model = Model(id="tiny", provider="openai", context_window=10_000, output_tokens=500)
+                session.model = Model(id="tiny", provider="openai", context_window=20_000, output_tokens=500)
+                session._edit_tools = []
 
                 yielded = [type(event).__name__ async for event in session.prompt("new prompt")]
                 entries = store.entries(info.id)
@@ -1258,6 +1278,320 @@ class AgentSessionPersistenceTests(unittest.TestCase):
         self.assertIn("todo items are still pending", rejected)
         self.assertEqual(status, "completed")
         self.assertFalse(completion_candidate)
+
+
+@pytest.fixture(params=["jsonl", "sqlite"])
+def context_session(tmp_path, monkeypatch, request):
+    store = (
+        SessionStore(tmp_path / "sessions", cwd=tmp_path)
+        if request.param == "jsonl"
+        else SqliteSessionStore(tmp_path / "spice.db", cwd=tmp_path)
+    )
+    session = AgentSession(
+        cwd=tmp_path, session_store=store,
+        config=SpiceConfig(memory_enabled=False, subagents_enabled=False),
+    )
+    session.model = Model(id="tiny", provider="openai", context_window=12_000, output_tokens=500)
+    monkeypatch.setattr(session, "_build_system_message", lambda: Message(role="system", content="project rules"))
+    session.messages[:] = [session._build_system_message()]
+    session._ensure_session()
+    session.messages.extend(Message(role="user", content=f"old {i} " + "x" * 1400) for i in range(8))
+    session._persist_messages_from(1)
+    monkeypatch.setattr(session, "_runtime_context", lambda: "runtime-only marker")
+    return session
+
+
+def _context_route(session, monkeypatch, stream):
+    original = session_module.build_model_route
+
+    def build(*args, **kwargs):
+        route = original(*args, **kwargs)
+        route.stream_factory = stream
+        return route
+
+    monkeypatch.setattr(session_module, "build_model_route", build)
+
+
+def _raw_context_messages(session):
+    return [message_from_dict(entry.data["message"])
+            for entry in session.session_store.path_entries(session.session_id)
+            if entry.type == "message"]
+
+
+def _assert_complete_tool_rounds(messages):
+    pending = set()
+    for message in messages:
+        if message.tool_calls:
+            assert not pending
+            pending = {call.id for call in message.tool_calls}
+        elif message.role == "tool":
+            assert message.tool_call_id in pending
+            pending.remove(message.tool_call_id)
+        else:
+            assert not pending
+    assert not pending
+
+
+def test_context_compacts_repeatedly_and_resumes_without_losing_rounds(context_session, monkeypatch):
+    session = context_session
+    seen = []
+    summaries = []
+    observed = []
+    session.subscribe(observed.append)
+
+    async def execute(args, context):
+        return tool_result("result:" + args["value"] + "x" * 3600)
+
+    session._edit_tools = [Tool("demo", "demo", {"type": "object"}, execute)]
+
+    async def summary(**kwargs):
+        plan = kwargs["plan"]
+        summaries.append(plan)
+        _assert_complete_tool_rounds(plan.messages_to_summarize)
+        _assert_complete_tool_rounds(plan.kept_messages)
+        assert len(_raw_context_messages(session)) >= 12
+        return "checkpoint: continue the requested inspection"
+
+    async def stream(model, messages, tools, options):
+        seen.append(list(messages))
+        assert not check_compaction_needed(messages, model, tools=tools).should_compact
+        _assert_complete_tool_rounds([m for m in messages if m.content != "runtime-only marker"])
+        assert sum(m.content == "runtime-only marker" for m in messages) == 1
+        turn = len(seen)
+        if turn <= 5:
+            yield ReasoningDelta(f"reasoning {turn}")
+            for part in ("a", "b"):
+                yield ToolCallEvent(f"tc{turn}{part}", "demo", {"value": part})
+            yield Done("tool_calls")
+        else:
+            yield TextDelta("finished")
+            yield Done("stop")
+
+    monkeypatch.setattr(session_module, "generate_summary", summary)
+    _context_route(session, monkeypatch, stream)
+    original_messages = session.messages
+    events = asyncio.run(_collect_context_events(session))
+
+    assert len(summaries) >= 2
+    assert len(seen) == 6
+    assert session.messages is original_messages
+    assert events == observed
+    assert not any(isinstance(event, AgentErrorEvent) for event in events)
+    assert [event.round_index for event in events if isinstance(event, RoundCompleteEvent)] == [1, 2, 3, 4, 5]
+    raw = _raw_context_messages(session)
+    assert len(raw) == 25
+    assert sum(message.content == "continue inspection" for message in raw) == 1
+    assert raw[-1].content == "finished"
+    assert len({m.tool_call_id for m in raw if m.role == "tool"}) == 10
+    assert all("_reasoning_content" not in m.metadata for m in raw)
+    assert all(m.content != "runtime-only marker" for m in raw)
+    for turn, request_messages in enumerate(seen[1:], 1):
+        previous = next(m for m in request_messages if any(c.id == f"tc{turn}a" for c in m.tool_calls))
+        assert previous.metadata["_reasoning_content"] == f"reasoning {turn}"
+    resumed = AgentSession(cwd=session.cwd, session_store=session.session_store,
+                           session_id=session.session_id, config=session.config)
+    assert resumed.messages[-1].content == "finished"
+    _assert_complete_tool_rounds(resumed.messages)
+
+
+async def _collect_context_events(session):
+    return [event async for event in session.prompt("continue inspection")]
+
+
+@pytest.mark.parametrize("failure", ["summary_error", "empty", "exception", "still_large", "large_round"])
+def test_context_failure_stops_and_preserves_progress(context_session, monkeypatch, failure):
+    session = context_session
+    calls = []
+    summaries = []
+    if failure == "large_round":
+        session.reset()
+        session.model = Model(id="tiny", provider="openai", context_window=6000, output_tokens=500)
+    session.start_long_task("inspect safely")
+
+    async def execute(args, context):
+        return tool_result("x" * (24_000 if failure == "large_round" else 8000))
+
+    session._edit_tools = [Tool("demo", "demo", {"type": "object"}, execute)]
+
+    async def summary(**kwargs):
+        summaries.append(kwargs["plan"])
+        if failure == "summary_error":
+            raise CompactionError("summary unavailable")
+        if failure == "exception":
+            raise RuntimeError("summary transport failed")
+        if failure == "empty":
+            return "  "
+        return "checkpoint" if failure == "large_round" else "too large " * 8000
+
+    async def stream(model, messages, tools, options):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            yield ToolCallEvent("tc1", "demo", {})
+            yield Done("tool_calls")
+        else:
+            yield TextDelta("must not execute")
+            yield Done("stop")
+
+    monkeypatch.setattr(session_module, "generate_summary", summary)
+    _context_route(session, monkeypatch, stream)
+    events = asyncio.run(_collect_context_events(session))
+    assert len(calls) == 1
+    assert len(summaries) <= 1
+    assert any(isinstance(e, AgentErrorEvent) and e.kind == "context_limit" for e in events)
+    assert [e.stop_reason for e in events if isinstance(e, TurnEndEvent)] == ["context_limit"]
+    raw = _raw_context_messages(session)
+    _assert_complete_tool_rounds(raw)
+    assert raw[-1].role == "tool"
+    assert session.long_task_state.needs_user_attention
+    resumed = AgentSession(cwd=session.cwd, session_store=session.session_store,
+                           session_id=session.session_id, config=session.config)
+    _assert_complete_tool_rounds(resumed.messages)
+    assert resumed.long_task_state.needs_user_attention
+
+    if failure != "large_round":
+        async def good_summary(**kwargs):
+            return "recovered checkpoint"
+
+        async def finish(model, messages, tools, options):
+            yield TextDelta("recovered")
+            yield Done("stop")
+
+        resumed.model = session.model
+        resumed._edit_tools = session._edit_tools
+        monkeypatch.setattr(resumed, "_build_system_message", session._build_system_message)
+        resumed._refresh_system_message()
+        monkeypatch.setattr(session_module, "generate_summary", good_summary)
+        _context_route(resumed, monkeypatch, finish)
+        recovered = asyncio.run(_collect_context_events(resumed))
+        assert not any(isinstance(e, AgentErrorEvent) for e in recovered)
+        assert resumed.messages[-1].content == "recovered"
+        assert sum(m.tool_call_id == "tc1" for m in _raw_context_messages(resumed)) == 1
+
+
+@pytest.mark.parametrize("cancel_at", ["summary", "hook", "next_tool"])
+def test_context_cancellation_keeps_checkpoint_and_tool_pairs(context_session, monkeypatch, cancel_at):
+    session = context_session
+    reached = asyncio.Event()
+    calls = 0
+
+    async def execute(args, context):
+        if calls == 2:
+            reached.set()
+            await asyncio.Event().wait()
+        return tool_result("x" * 8000)
+
+    session._edit_tools = [Tool("demo", "demo", {"type": "object"}, execute)]
+
+    async def summary(**kwargs):
+        if cancel_at == "summary":
+            reached.set()
+            await asyncio.Event().wait()
+        return "checkpoint"
+
+    async def hook(event):
+        if cancel_at == "hook":
+            reached.set()
+            await asyncio.Event().wait()
+
+    async def stream(model, messages, tools, options):
+        nonlocal calls
+        calls += 1
+        yield ToolCallEvent(f"tc{calls}", "demo", {})
+        yield Done("tool_calls")
+
+    session.hooks.register(CompactionCompleted, hook)
+    monkeypatch.setattr(session_module, "generate_summary", summary)
+    _context_route(session, monkeypatch, stream)
+
+    async def run():
+        task = asyncio.create_task(_collect_context_events(session))
+        await asyncio.wait_for(reached.wait(), 2)
+        task.cancel()
+        return await task
+
+    events = asyncio.run(run())
+    assert any(isinstance(e, AgentErrorEvent) and e.kind == "user_interrupted" for e in events)
+    raw = _raw_context_messages(session)
+    _assert_complete_tool_rounds(raw)
+    assert sum(m.tool_call_id == "tc1" for m in raw) == 1
+    if cancel_at == "next_tool":
+        interrupted = next(m for m in raw if m.tool_call_id == "tc2")
+        assert interrupted.is_error
+    resumed = AgentSession(cwd=session.cwd, session_store=session.session_store,
+                           session_id=session.session_id, config=session.config)
+    _assert_complete_tool_rounds(resumed.messages)
+    assert [m.tool_call_id for m in resumed.messages if m.role == "tool"] == [
+        m.tool_call_id for m in session.messages if m.role == "tool"
+    ]
+
+
+def test_context_without_safe_boundary_preserves_new_prompt(context_session, monkeypatch):
+    session = context_session
+    session.reset()
+    session._edit_tools = []
+    calls = []
+
+    async def stream(model, messages, tools, options):
+        calls.append("model")
+        yield Done("stop")
+
+    async def summary(**kwargs):
+        calls.append("summary")
+        return "checkpoint"
+
+    monkeypatch.setattr(session_module, "generate_summary", summary)
+    _context_route(session, monkeypatch, stream)
+    prompt = "x" * 30_000
+
+    async def run():
+        return [event async for event in session.prompt(prompt)]
+
+    events = asyncio.run(run())
+    assert calls == []
+    assert [e.stop_reason for e in events if isinstance(e, TurnEndEvent)] == ["context_limit"]
+    assert [m.content for m in _raw_context_messages(session)] == [prompt]
+
+
+def test_context_compaction_keeps_deferred_todo_and_plan_mode(context_session, monkeypatch):
+    session = context_session
+    update_todo = next(tool for tool in session._edit_tools if tool.name == "update_todo")
+    session.start_plan("inspect only")
+    calls = []
+    summaries = []
+
+    async def execute(args, context):
+        await update_todo.execute(
+            {"todos": [{"id": "1", "content": "latest todo", "status": "in_progress"}]}, context,
+        )
+        return tool_result("x" * 8000)
+
+    session._plan_tools = [Tool("demo", "demo", {"type": "object"}, execute)]
+
+    async def summary(**kwargs):
+        summaries.append(kwargs["plan"])
+        assert session.todo_state.read()[0]["content"] == "latest todo"
+        assert session._load_todo_state().read() == session.todo_state.read()
+        return "inspect only checkpoint"
+
+    async def stream(model, messages, tools, options):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            yield ToolCallEvent("tc1", "demo", {})
+            yield Done("tool_calls")
+        else:
+            yield TextDelta("plan ready")
+            yield Done("stop")
+
+    monkeypatch.setattr(session_module, "generate_summary", summary)
+    _context_route(session, monkeypatch, stream)
+    events = asyncio.run(_collect_context_events(session))
+    assert len(summaries) == 1
+    assert not any(isinstance(e, AgentErrorEvent) for e in events)
+    assert session.plan_state.is_plan_mode
+    assert session.todo_state.read()[0]["content"] == "latest todo"
+    resumed = AgentSession(cwd=session.cwd, session_store=session.session_store,
+                           session_id=session.session_id, config=session.config)
+    assert resumed.todo_state.read() == session.todo_state.read()
 
 
 if __name__ == "__main__":

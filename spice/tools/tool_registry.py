@@ -12,8 +12,10 @@ from spice.llm.types import ToolSchema
 from spice.tools.base import Tool
 from spice.tools.base import normalize_tool_arguments
 from spice.tools.bash import create_bash_tools
+from spice.tools.browser import create_browser_tools
 from spice.tools.core import create_core_tools
 from spice.tools.file import create_file_tools
+from spice.tools.image import create_image_tools
 from spice.tools.memory import create_memory_tools
 from spice.tools.skill import create_skill_tools
 from spice.tools.subagent import create_subagent_tool
@@ -21,15 +23,16 @@ from spice.tools.web import create_web_tools
 
 TOOLSETS = {
     "core": ["get_current_time"],
-    "file": ["list_dir", "read_file", "read_files", "write_file", "edit_file", "apply_patch", "search_files"],
+    "file": ["list_dir", "read_file", "read_files", "view_image", "write_file", "edit_file", "apply_patch", "search_files"],
     "bash": ["bash"],
     "web": ["web_search"],
+    "browser": ["browser_check"],
     "skill": ["skills_list", "skill_view"],
     "memory": ["memory"],
     "subagent": ["spawn_subagents"],
 }
 
-READ_ONLY_TOOLS = ["get_current_time", "list_dir", "read_file", "read_files", "search_files", "web_search", "skills_list", "skill_view"]
+READ_ONLY_TOOLS = ["get_current_time", "list_dir", "read_file", "read_files", "view_image", "search_files", "web_search", "skills_list", "skill_view"]
 
 
 @dataclass(frozen=True)
@@ -97,8 +100,10 @@ def create_all_tools(*, memory_enabled: bool = False, subagents_enabled: bool = 
     tools = [
         *create_core_tools(),
         *create_file_tools(),
+        *create_image_tools(),
         *create_bash_tools(),
         *create_web_tools(),
+        *create_browser_tools(),
         *create_skill_tools(),
     ]
     if memory_enabled:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
+
+import pytest
 
 import spice.agent.loop as loop_module
 from spice.agent.events import (
@@ -14,6 +17,8 @@ from spice.agent.events import (
 from spice.agent.loop import run_turn
 from spice.llm.messages import Message
 from spice.llm.models import Model, ModelPricing
+from spice.llm.retry import ModelRetryPolicy
+from spice.llm.routing import ModelCandidate, ModelRoute
 from spice.llm.types import (
     Done,
     ModelRequestOptions,
@@ -23,7 +28,7 @@ from spice.llm.types import (
     ToolCallEvent,
 )
 from spice.llm.usage import TokenUsage
-from spice.tools.base import Tool, ToolContext, tool_result
+from spice.tools.base import Tool, ToolContext, tool_error, tool_result
 
 
 async def _ok_tool(args: dict, context: ToolContext):
@@ -251,9 +256,15 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 confirm=None,
             )
         ]
-        self.assertIsInstance(events[-1], AgentErrorEvent)
-        self.assertIn("Stopped after", events[-1].message)
-        self.assertIn("30 tool rounds", events[-1].message)
+        self.assertIsInstance(events[-2], AssistantMessageEvent)
+        self.assertIsInstance(events[-1], TurnEndEvent)
+        self.assertEqual(events[-1].stop_reason, "max_tool_rounds")
+        self.assertEqual(events[-1].status, "paused")
+        self.assertIn("100 轮工具预算", events[-1].text)
+        self.assertFalse(any(isinstance(event, AgentErrorEvent) for event in events))
+        self.assertEqual(
+            sum(isinstance(event, ToolExecutionEndEvent) for event in events), 100
+        )
 
     async def test_subagent_manager_is_passed_to_tool_context(self) -> None:
         sentinel = object()
@@ -406,3 +417,102 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end.text, "partial")
         self.assertEqual(messages[-1].role, "assistant")
         self.assertEqual(messages[-1].content, "partial")
+
+
+@pytest.mark.parametrize("source", ["prompt", "runtime", "schema", "reasoning"])
+def test_context_guard_counts_full_request_without_compactor(tmp_path, monkeypatch, source):
+    calls = []
+
+    async def stream(model, messages, tools, options):
+        calls.append(messages)
+        yield Done("stop")
+
+    monkeypatch.setattr(loop_module, "stream_model", stream)
+    messages = [Message(role="system", content="rules")]
+    if source == "reasoning":
+        messages.append(Message(role="assistant", metadata={"_reasoning_content": "x" * 2000}))
+    tools = [Tool("demo", "x" * 2000, {"type": "object"}, _ok_tool)] if source == "schema" else []
+
+    async def run():
+        return [event async for event in run_turn(
+            prompt="x" * 2000 if source == "prompt" else "continue",
+            messages=messages, model=Model(id="tiny", provider="fake", context_window=1000, output_tokens=100),
+            tools=tools, options=ModelRequestOptions(), cwd=tmp_path, confirm=None,
+            runtime_context="x" * 2000 if source == "runtime" else None,
+        )]
+
+    events = asyncio.run(run())
+    assert calls == []
+    assert isinstance(events[-2], AgentErrorEvent)
+    assert events[-2].kind == "context_limit"
+    assert events[-1].stop_reason == "context_limit"
+
+
+@pytest.mark.parametrize("stop", ["fatal", "round_limit"])
+def test_context_guard_does_not_compact_after_terminal_round(tmp_path, monkeypatch, stop):
+    compacted = []
+
+    async def stream(model, messages, tools, options):
+        yield ToolCallEvent("tc1", "demo", {})
+        yield Done("tool_calls")
+
+    async def execute(args, context):
+        if stop == "fatal":
+            return tool_error("x" * 2000, disposition="fatal")
+        return tool_result("x" * 2000)
+
+    async def compact(model, options):
+        compacted.append(model)
+
+    monkeypatch.setattr(loop_module, "stream_model", stream)
+
+    async def run():
+        return [event async for event in run_turn(
+            prompt="continue", messages=[Message(role="system", content="rules")],
+            model=Model(id="tiny", provider="fake", context_window=1000, output_tokens=100),
+            tools=[Tool("demo", "demo", {"type": "object"}, execute)],
+            options=ModelRequestOptions(), cwd=tmp_path, confirm=None,
+            max_tool_rounds=1 if stop == "round_limit" else 3, compact_context=compact,
+        )]
+
+    events = asyncio.run(run())
+    assert compacted == []
+    assert [e.stop_reason for e in events if isinstance(e, TurnEndEvent)] == [
+        "fatal_tool_error" if stop == "fatal" else "max_tool_rounds"
+    ]
+
+
+def test_context_guard_uses_active_fallback_model_budget(tmp_path):
+    calls = []
+    primary = Model(id="primary", provider="fake", context_window=10_000, output_tokens=100)
+    fallback = Model(id="fallback", provider="fake", context_window=1000, output_tokens=100)
+    options = ModelRequestOptions(max_tokens=100)
+
+    async def stream(model, messages, tools, options):
+        calls.append(model.id)
+        if model is primary:
+            yield StreamError("unavailable", retryable=True)
+        else:
+            yield ToolCallEvent("tc1", "demo", {})
+            yield Done("tool_calls")
+
+    async def execute(args, context):
+        return tool_result("x" * 2000)
+
+    route = ModelRoute(
+        [ModelCandidate(m.id, m, options) for m in [primary, fallback]],
+        retry_policy=ModelRetryPolicy(enabled=False, max_attempts=1),
+        fallback_enabled=True, stream_factory=stream,
+    )
+
+    async def run():
+        return [event async for event in run_turn(
+            prompt="continue", messages=[Message(role="system", content="rules")],
+            model=primary, model_route=route,
+            tools=[Tool("demo", "demo", {"type": "object"}, execute)],
+            options=options, cwd=tmp_path, confirm=None,
+        )]
+
+    events = asyncio.run(run())
+    assert calls == ["primary", "fallback"]
+    assert events[-1].stop_reason == "context_limit"

@@ -56,6 +56,7 @@ class LongTaskState:
     session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
+    verification: dict[str, Any] = field(default_factory=lambda: {"status": "unverified", "records": []})
 
     @property
     def is_active(self) -> bool:
@@ -82,6 +83,7 @@ class LongTaskState:
         self.status = "active"
         self.session_id = session_id or self.session_id
         self.continuation_rounds = 0
+        self.verification = {"status": "unverified", "records": []}
         self.max_continuation_rounds = _clamp_positive_int(max_continuation_rounds, default=self.max_continuation_rounds)
         self.needs_user_attention = False
         self.last_stop_reason = ""
@@ -134,6 +136,7 @@ class LongTaskState:
             "Do not continue indefinitely. If the continuation budget is exhausted, or further progress needs a user decision, stop and ask the user before proceeding.",
             "",
             "Continue working toward this objective using available tools. If the objective is fully done and verified, call complete_long_task. If it is replaced or cancelled, update the sustained goal explicitly.",
+            "验证代码时调用 bash 并设置 verification=true，保留命令、退出码与代码状态证据。验证后修改代码需重新验证。无适用验证命令的任务可以完成，但必须明确未验证。", 
         ]
         if self.needs_user_attention:
             lines.extend(
@@ -169,6 +172,7 @@ class LongTaskState:
             "needsUserAttention": self.needs_user_attention,
             "lastStopReason": self.last_stop_reason,
             "completionCandidate": self.completion_candidate,
+            "verification": dict(self.verification),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -204,6 +208,7 @@ class LongTaskState:
             needs_user_attention=bool(data.get("needsUserAttention")),
             last_stop_reason=str(data.get("lastStopReason") or ""),
             completion_candidate=bool(data.get("completionCandidate")),
+            verification=dict(data["verification"]) if isinstance(data.get("verification"), dict) else {"status": "unverified", "records": []},
             created_at=str(data.get("createdAt") or ""),
             updated_at=str(data.get("updatedAt") or ""),
         )
@@ -264,6 +269,7 @@ class LongTaskStore:
             "nextAction": next_action,
             "lastError": last_error,
             "lastStopReason": state.last_stop_reason,
+            "verification": dict(state.verification),
             "updatedAt": _now(),
         }
         self._write_json(self.task_dir(state.task_id) / "checkpoint.json", payload)

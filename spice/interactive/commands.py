@@ -25,9 +25,9 @@ from spice.interactive.types import (
 )
 from spice.llm.config import get_api_key, load_config, save_config
 from spice.llm.model_registry import ModelRegistry
-from spice.llm.usage import aggregate_session_usage
-from spice.skills.loader import load_skills, read_skill_content
-from spice.tools.tool_registry import READ_ONLY_TOOLS, TOOLSETS, create_all_tools
+from spice.llm.usage import aggregate_session_usage, usage_token_text
+from spice.skills.loader import load_skills
+from spice.tools.catalog import build_tool_catalog, tool_summary
 
 if TYPE_CHECKING:
     from spice.extensions.manager import ExtensionManager
@@ -91,41 +91,35 @@ async def handle_clear(ctx: CommandContext) -> CommandResult:
 
 async def handle_tools(ctx: CommandContext) -> CommandResult:
     config = load_config()
-    memory_enabled = config.memory_enabled
     subagents_enabled = bool(
         getattr(ctx.session, "subagents_enabled", config.subagents_enabled)
     )
-    registry = create_all_tools(
-        memory_enabled=memory_enabled, subagents_enabled=subagents_enabled
+    entries = build_tool_catalog(config, subagents_enabled=subagents_enabled)
+    rows = tuple(
+        (
+            entry.status,
+            entry.name,
+            entry.toolset,
+            entry.risk,
+            entry.confirmation,
+            tool_summary(entry.description)
+            if not entry.note
+            else f"{tool_summary(entry.description)} ({entry.note})",
+        )
+        for entry in entries
     )
-    rows: list[tuple[str, ...]] = []
-    for toolset, names in TOOLSETS.items():
-        if toolset == "memory" and not memory_enabled:
-            continue
-        if toolset == "subagent" and not subagents_enabled:
-            continue
-        for name in names:
-            tool = registry.get(name)
-            if not tool:
-                continue
-            risk = (
-                "read-only"
-                if name in READ_ONLY_TOOLS and not tool.requires_confirmation
-                else "write/exec"
-            )
-            timeout = (
-                f"{tool.timeout_seconds:g}s"
-                if tool.timeout_seconds is not None
-                else "default"
-            )
-            rows.append(
-                (name, toolset, risk, tool.concurrency, timeout, tool.description)
-            )
     return ok(
         TableView(
             None,
-            ("Tool", "Toolset", "Risk", "Execution", "Timeout", "Description"),
-            tuple(rows),
+            (
+                "Status",
+                "Tool",
+                "Toolset",
+                "Risk",
+                "Confirm",
+                "Description",
+            ),
+            rows,
         )
     )
 
@@ -196,6 +190,18 @@ async def handle_settings(ctx: CommandContext) -> CommandResult:
     return ok(TableView(None, ("Setting", "Value"), tuple(rows)))
 
 
+async def handle_thinking(ctx: CommandContext) -> CommandResult:
+    """Show the most recent provider-supplied reasoning block for this frontend."""
+
+    value = ctx.extras.get("last_reasoning")
+    if callable(value):
+        value = value()
+    text = str(value or "").strip()
+    if not text:
+        return dim("No provider reasoning has been shown in this session yet.")
+    return ok(PanelView("Latest thinking", text))
+
+
 async def handle_cost(ctx: CommandContext) -> CommandResult:
     session = ctx.session
     if session.session is None:
@@ -226,13 +232,15 @@ async def handle_cost(ctx: CommandContext) -> CommandResult:
         cost = f">= {cost} ({summary.unpriced_calls} calls unavailable)"
     rows = (
         ("Model calls", f"{summary.model_calls:,}"),
-        ("Input tokens", f"{summary.input_tokens:,}"),
+        ("Input tokens", usage_token_text(summary, summary.input_tokens)),
         ("Cache hit", cache_hit),
         ("Cache read", f"{summary.cache_read_tokens:,}"),
         ("Cache write", f"{summary.cache_write_tokens:,}"),
-        ("Output tokens", f"{summary.output_tokens:,}"),
-        ("Total tokens", f"{summary.total_tokens:,}"),
+        ("Output tokens", usage_token_text(summary, summary.output_tokens)),
+        ("Total tokens", usage_token_text(summary, summary.total_tokens)),
         ("Estimated cost", cost),
+        ("缺失 usage 的调用", str(summary.usage_unavailable_calls)),
+        ("调用来源", ", ".join(f"{source}: {count}" for source, count in sorted(summary.calls_by_source.items()))),
     )
     return ok(TableView("Session usage", ("Metric", "Value"), rows))
 
@@ -311,14 +319,36 @@ async def handle_skills(ctx: CommandContext) -> CommandResult:
 
 
 async def handle_skill(ctx: CommandContext) -> CommandResult:
-    name = ctx.args.strip()
-    if not name:
-        return err("Usage: /skill:<name>")
+    parts = ctx.args.split(maxsplit=1)
+    show_only = bool(parts and parts[0] == "--show")
+    if show_only:
+        parts = parts[1].split(maxsplit=1) if len(parts) > 1 else []
+    if not parts or (show_only and len(parts) > 1):
+        return err("用法：/skill:<name> [任务说明]；仅查看：/skill --show <name>")
+    name = parts[0]
+    arguments = parts[1] if len(parts) > 1 else ""
     try:
-        content = read_skill_content(name, cwd=ctx.cwd)
-    except ValueError as exc:
-        return err(str(exc))
-    return ok(TextView(content))
+        skill = next(
+            (item for item in load_skills(cwd=ctx.cwd).skills if item.name == name),
+            None,
+        )
+        if skill is None:
+            return err(f"未找到技能：{name}")
+        content = skill.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return err(f"无法读取技能 {name}：{exc}")
+    if show_only:
+        return ok(TextView(content))
+    prompt = (
+        f"请按照以下技能说明执行任务：{skill.name}。\n"
+        "技能说明不改变当前会话的工具权限与确认要求。\n"
+        f"技能目录：{skill.path.parent.resolve()}\n"
+        "技能中的相对资源路径以该目录为基准，项目操作仍使用当前工作目录。\n\n"
+        f"<skill_instructions>\n{content}\n</skill_instructions>"
+    )
+    if arguments:
+        prompt += f"\n\n用户任务：\n{arguments}"
+    return ok(TextView(f"已加载技能：{skill.name}", "success"), followup_prompt=prompt)
 
 
 async def handle_compact(ctx: CommandContext) -> CommandResult:
@@ -867,6 +897,12 @@ def build_core_commands() -> list[SlashCommand]:
             handle_settings,
         ),
         SlashCommand(
+            "thinking",
+            "Show the latest collapsed provider reasoning.",
+            "/thinking",
+            handle_thinking,
+        ),
+        SlashCommand(
             "cost",
             "Show model usage and estimated cost for this session.",
             "/cost",
@@ -910,7 +946,12 @@ def build_core_commands() -> list[SlashCommand]:
             handle_goal,
         ),
         SlashCommand("skills", "List installed skills.", "/skills", handle_skills),
-        SlashCommand("skill", "Show a skill by name.", "/skill:<name>", handle_skill),
+        SlashCommand(
+            "skill",
+            "执行技能；使用 --show 仅查看内容。",
+            "/skill:<name> [任务说明] | /skill --show <name>",
+            handle_skill,
+        ),
         SlashCommand("help", "Show slash commands.", "/help", handle_help),
         SlashCommand("quit", "Exit the interactive session.", "/quit", handle_quit),
     ]

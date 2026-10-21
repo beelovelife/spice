@@ -11,7 +11,7 @@ Spice 强调架构边界清晰、运行链路可追踪、会话可恢复、工�
 ## ✨ 主要特性
 
 - **多 provider 支持**：内置 OpenAI、DeepSeek、Anthropic、Gemini 等模型，包括 Claude Haiku 4.5、Sonnet 4.6 与 Opus 4.8，统一通过模型注册表与 `~/.spice/settings.json` 管理。
-- **双前端体验**：`spice` / `spice chat` 走基于 `prompt_toolkit` 的交互式 CLI，`spice tui` 进入全屏 TUI；二者复用同一套 agent、session 服务和 command registry。
+- **双前端体验**：`spice` / `spice chat` 走基于 `prompt_toolkit` 的交互式 CLI，`spice tui` 进入 Textual 全屏 TUI；二者复用同一套 agent、session 服务和 command registry。
 - **流式 agent loop**：明确的 `prompt → turn_start → assistant stream → tool calls → tool results → turn_end → agent_end` 事件流，UI、会话持久化、trace 都挂在事件上。
 - **受控工具体系**：内置 `file`、`bash`、`web`、`skill`、`memory`、`subagent` 等工具集合，统一 schema / 执行 / 错误结构，支持 read-only 模式与确认门。
 - **会话持久化与树状历史**：默认使用可读的 JSONL 文件，也可切换 SQLite；支持 `resume`、`rewind`、`prune`、`workspaces` 等管理命令。
@@ -20,7 +20,7 @@ Spice 强调架构边界清晰、运行链路可追踪、会话可恢复、工�
 - **Skills 与 Extensions**：`~/.spice/skills/` 沉淀工作流，`~/.spice/extensions/*.py` 提供可信本地扩展，能注册工具、slash command 与 hook。
 - **MCP 客户端**：通过 stdio 或 Streamable HTTP 连接 MCP Server，将发现的工具接入统一 Tool、确认、trace 与超时链路。
 - **长任务与子代理**：内置 long task 状态机和 `spawn_subagents` 工具，可在主 agent 中分发子任务。
-- **诊断友好**：`spice logs`、`spice config`、`spice skills doctor`、`spice memory status` 等命令把运行状态与配置完全可视化。
+- **诊断友好**：`spice doctor` 汇总运行环境、模型、存储、工具、skills、extensions 与 MCP 状态；`spice tools` 展示当前工具能力和确认要求。
 
 ---
 
@@ -62,6 +62,17 @@ uv sync
 source .venv/bin/activate
 spice --version
 ```
+
+若希望在任意目录运行正在修改的本地源码，可在项目目录安装 editable 全局工具：
+
+```bash
+uv tool install --editable .
+```
+
+此后修改 Python 源码会在下次启动 `spice` 时生效。全局工具环境与项目 `.venv` 独立：
+`uv sync` / `uv run` 更新项目环境，新增或调整依赖后还需在项目目录执行
+`uv tool install --force --editable .`，同步全局工具依赖。
+若使用浏览器工具，则安装或同步时使用 `uv tool install --force --editable '.[browser]'`，保留浏览器可选依赖。
 
 #### 更新 Spice
 
@@ -125,18 +136,21 @@ spice config set default-model gpt-5.1
       "provider": "deepseek",
       "model": "deepseek-v4-pro",
       "baseUrl": "https://api.deepseek.com",
-      "protocol": "openai-completions",
+      "protocol": "openai-responses",
       "temperature": 0.2
     }
   }
 }
 ```
 
+Flash 的当前 API 模型名为 `deepseek-flash`，对应 DeepSeek V4.1 Flash；可在 `/models` 中选择 `deepseek/deepseek-flash`。旧 `deepseek-v4-flash` 选择仍可解析到新版。内置 Flash 费用按官方峰时费率估算，非峰时实际费用更低，详见 [DeepSeek 模型与价格](https://api-docs.deepseek.com/quick_start/pricing/)。
+
 ### 5. 运行
 
 ```bash
 spice                           # 交互式 CLI
-spice tui                       # 全屏 TUI
+spice tui                       # Textual 全屏 TUI
+spice tui --legacy              # 临时回退到旧 prompt_toolkit TUI
 spice run "你好，介绍一下自己" # 单次 prompt
 ```
 
@@ -159,6 +173,7 @@ uv run spice run "你好，介绍一下自己"
 | `spice`                             | 进入交互式 CLI（默认入口）                          |
 | `spice chat`                        | 显式进入交互式 CLI                                  |
 | `spice tui`                         | 进入全屏 TUI                                        |
+| `spice tui --legacy`                | 临时使用旧 prompt_toolkit TUI                       |
 | `spice chat --trace`                | 交互式 CLI，并记录本次启动的多轮 trace              |
 | `spice tui --trace`                 | 全屏 TUI，并记录本次启动的多轮 trace                |
 | `spice run "<prompt>"`              | 单次执行 prompt，stdout 保持脚本化                  |
@@ -166,9 +181,20 @@ uv run spice run "你好，介绍一下自己"
 | `spice trace inspect <path.json>`    | 查看 trace 的步骤、工具结果、usage 和事件           |
 | `spice resume <session-id>`         | 按 id 恢复一个会话                                  |
 | `spice models`                      | 列出 provider/model 与当前配置、API key 状态        |
+| `spice doctor [--json] [--verbose]` | 本地检查配置、模型、存储、工具与扩展，不请求模型    |
+| `spice tools [--json]`              | 列出内置工具、状态、风险等级和确认要求              |
+| `spice tools show <name>`           | 查看单个工具的完整状态和参数 JSON Schema            |
 | `spice logs [--tail N] [--path]`    | 查看 Spice 运行日志路径与最近日志                   |
 | `spice --version` / `-v`            | 显示版本                                            |
 | `spice --debug`                     | 开启调试日志                                        |
+
+主 agent 每次用户请求最多执行 100 轮模型/工具交互。预算用尽后，会额外尝试一次不调用工具的收尾请求
+（最多 2,048 输出 tokens、30 秒，不重试），整理已记录的进展、验证状态和剩余工作；失败时使用本地执行记录摘要。
+CLI/TUI 将其显示为“暂停待继续”，已完成的工具结果和续跑检查点会保存到当前会话。在同一会话输入“继续”，
+或恢复该会话后继续输入，即可接着处理。正常结束和执行失败分别记录为 `completed`、`failed`，预算用尽记录为 `paused`；
+`completed` 表示本轮正常结束，验证是否通过仍以验证记录为准。
+`spice run` 的退出码为：`0` 正常结束、`1` 执行失败、`2` 预算用尽待继续、`130` 中断；
+`--json` 的 `turn_end` 事件包含 `status` 和可选的 `checkpoint`。
 
 ### 会话管理（`spice sessions`）
 
@@ -202,7 +228,7 @@ uv run spice run "你好，介绍一下自己"
 
 `--debug` 提升标准运行日志级别；`run --trace` 生成结构化运行轨迹。
 
-交互执行过程中，TUI 可用 `Esc` 或 `Ctrl+C` 取消当前模型/工具调用并继续会话；普通 CLI 可用 `Ctrl+C`。取消不会回滚工具已经产生的文件或外部副作用。
+交互执行过程中，TUI 可用 `Esc` 或 `Ctrl+C` 取消当前模型/工具调用并继续会话；普通 CLI 可用 `Ctrl+C`。取消不会回滚工具已经产生的文件或外部副作用。Textual TUI 在工作时仍可继续输入，提交的内容会进入可见队列；provider 返回的 Thinking 会在流式阶段展开，完成后自动折叠并可点击重新展开。普通 CLI 会把完成的 Thinking 收成摘要，可通过 `/thinking` 查看最近一段全文。
 
 ### Sandbox（`spice sandbox`）
 
@@ -293,6 +319,7 @@ Spice 从 `~/.spice/settings.json` 的 `mcpServers` 读取全局服务器，并�
 | `/tools`            | 查看内置工具与启用状态                              |
 | `/mcp [reload]`     | 查看 MCP 连接状态，或重载服务器和工具               |
 | `/settings`         | 当前交互设置（模型、reasoning、工具开关、输出模式） |
+| `/thinking`         | 查看最近一次已折叠的 provider reasoning             |
 | `/cost`、`/usage`   | 查看当前会话的 token usage 与预估费用               |
 | `/subagent [on|off|status]` | 控制子代理工具开关                          |
 | `/compact [status|focus]`  | 手动压缩上下文                              |
@@ -301,11 +328,20 @@ Spice 从 `~/.spice/settings.json` 的 `mcpServers` 读取全局服务器，并�
 | `/task <objective|status|cancel|complete>` | 长任务管理                     |
 | `/goal <objective|status|cancel|complete>` | 长期目标管理                   |
 | `/skills`           | 列出已安装 skill                                    |
-| `/skill:<name>`     | 直接调用某个 skill                                  |
+| `/skill:<name> [任务说明]` | 加载 skill 并启动当前 agent 执行工作流          |
+| `/skill --show <name>` | 仅查看 skill 内容，不启动模型调用                |
 | `/help`             | 显示所有 slash command                              |
 | `/quit`             | 退出                                                |
 
 CLI 与 TUI 复用 command registry 和会话服务；少量界面相关的选择与渲染逻辑由各自前端实现。
+
+上下文容量保护会在首次模型请求前，以及完整工具轮次结束、下一次请求前检查预算，估算包括消息、运行时状态、临时 reasoning 和工具 schema。主会话超预算时先保存进度，再压缩旧历史，保留完整的 tool call/result 配对；压缩失败、没有安全分界或压缩后仍超预算时，以 `context_limit` 停止，不再继续调用主模型。已完成操作不会回滚，历史仍可恢复；可通过 `/compact`、减少输入或切换更大窗口模型后继续。子代理暂不自动压缩，超预算时返回错误。该保护依赖模型的 `context_window` 配置与轻量 token 估算，不是 provider 精确计数。
+
+图片按需进入模型输入：新上传的图片、`view_image` 和 `browser_check` 返回的图片供下一次模型回复使用，同轮多张图片一起发送；模型回复后，后续请求只保留文字与工具结果，不再累计发送旧图片。失败请求的重试仍携带尚未获得回复的图片。会话原始图片记录继续保留；需要再次查看时，模型重新调用图片或浏览器工具。CLI、TUI、子代理及恢复的会话使用同一规则。
+
+执行错误作为独立会话事件保存，不进入模型消息上下文。CLI/TUI 重新进入或 `/resume` 恢复会话时，按当前分支的原始顺序展示“历史错误”，后续成功的回复不会抹去先前的失败记录。旧会话只有失败状态、没有具体错误文本时，会显示失败提示并指向运行日志。
+
+验证通过与失败都绑定代码指纹及执行环境。代码或环境变化后，旧失败变为“证据过期，需复验”，保留原始失败记录；当前版本上的失败仍会阻止验证通过。收尾摘要包含需要关注的检查命令、退出码和原因。结构化编辑工具返回 `changed`、`files_changed` 等实际变更信息，无变化时不重复写盘；普通 bash 的退出码不作为文件变更或任务进展的证明。
 
 ---
 
@@ -335,7 +371,7 @@ Skill 是 Markdown 描述的复用工作流。Spice 从以下位置加载 `<name
 2. 项目级：从当前目录向上查找最近的 `.spice/skills/<name>/SKILL.md`
 3. 显式路径：通过 `--skill-path` 或 API 提供的 skill 文件/目录
 
-每个 skill 支持 `description`、`triggers`、`always` 等 frontmatter，可被模型通过 `skills_list` / `skill_view` 工具检索查看，或通过 `/skill:<name>` 直接触发。
+每个 skill 支持 `description`、`triggers`、`always` 等 frontmatter，可被模型通过 `skills_list` / `skill_view` 工具检索查看，或通过 `/skill:<name> [任务说明]`（也支持 `/skill <name> [任务说明]`）直接触发。调用会把技能说明、资源目录及可选任务说明交给当前 agent，继续遵守当前会话的模式、工具权限与确认要求；使用 `/skill --show <name>` 或 `spice skills view <name>` 可仅查看内容，不启动模型调用。
 
 ---
 
@@ -370,7 +406,7 @@ spice/
 ├── skills/       skill 加载与读取
 ├── storage/      文件与 SQLite 应用状态存储
 ├── tools/        工具 base、registry 与 file/bash/web/memory/subagent/skill 实现
-└── tui/          基于 prompt_toolkit 的全屏 TUI
+└── tui/          Textual 全屏 TUI 与临时 legacy 回退
 tests/            行为与回归测试
 ```
 

@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import asyncio
+import time
+from collections.abc import AsyncIterator, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, TYPE_CHECKING
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from spice.llm.types import StreamEvent
 
 from spice.llm.models import Model
 
@@ -61,6 +70,10 @@ class ModelUsageRecord:
     model_calls: int = 1
     estimated_cost_usd: str | None = None
     cost_source: str | None = None
+    call_id: str = ""
+    source: str = "main"
+    usage_available: bool = True
+    status: str = "completed"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +84,10 @@ class ModelUsageRecord:
             "model_calls": self.model_calls,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_source": self.cost_source,
+            "call_id": self.call_id,
+            "source": self.source,
+            "usage_available": self.usage_available,
+            "status": self.status,
         }
 
     @classmethod
@@ -84,6 +101,10 @@ class ModelUsageRecord:
             model_calls=max(_non_negative_int(data.get("model_calls", 1)), 1),
             estimated_cost_usd=_decimal_string(data.get("estimated_cost_usd")),
             cost_source=str(data.get("cost_source") or "") or None,
+            call_id=str(data.get("call_id") or ""),
+            source=str(data.get("source") or "main"),
+            usage_available=bool(data.get("usage_available", True)),
+            status=str(data.get("status") or "completed"),
         )
 
 
@@ -102,6 +123,8 @@ class SessionUsageSummary:
     cache_observed_input_tokens: int = 0
     cache_metrics_calls: int = 0
     cache_unavailable_calls: int = 0
+    usage_unavailable_calls: int = 0
+    calls_by_source: dict[str, int] = field(default_factory=dict)
 
     @property
     def cache_hit_rate(self) -> float | None:
@@ -110,17 +133,95 @@ class SessionUsageSummary:
         return self.cache_read_tokens / self.cache_observed_input_tokens
 
 
-def make_usage_record(model: Model, tokens: TokenUsage | None, *, duration_ms: int) -> ModelUsageRecord:
+def make_usage_record(
+    model: Model, tokens: TokenUsage | None, *, duration_ms: int,
+    source: str = "main", status: str = "completed",
+) -> ModelUsageRecord:
+    available = tokens is not None
     tokens = tokens or TokenUsage()
-    cost, source = estimate_cost(tokens, model)
+    cost, cost_source = estimate_cost(tokens, model) if available else (None, None)
     return ModelUsageRecord(
         provider=model.provider,
         model=model.id,
         tokens=tokens,
         duration_ms=max(int(duration_ms), 0),
         estimated_cost_usd=cost,
-        cost_source=source,
+        cost_source=cost_source,
+        call_id=uuid4().hex,
+        source=source,
+        usage_available=available,
+        status=status,
     )
+
+
+UsageObserver = Callable[[ModelUsageRecord], None]
+_usage_observer: ContextVar[UsageObserver | None] = ContextVar("usage_observer", default=None)
+
+
+@contextmanager
+def usage_scope(observer: UsageObserver):
+    """将用量观察器限定在当前异步任务；子任务继承，独立会话互不污染。"""
+    token = _usage_observer.set(observer)
+    try:
+        yield
+    finally:
+        _usage_observer.reset(token)
+
+
+async def track_model_stream(
+    model: Model, factory: Callable[[], AsyncIterator["StreamEvent"]], *, source: str = "main",
+) -> AsyncIterator["StreamEvent"]:
+    """每次实际请求记录一次，包括失败、取消和无 usage 的返回。"""
+    from spice.llm.types import Done, StreamError
+
+    observer = _usage_observer.get()
+    started = time.perf_counter()
+    recorded = False
+    status = "incomplete"
+
+    def record(tokens: TokenUsage | None, state: str) -> ModelUsageRecord:
+        nonlocal recorded
+        usage = make_usage_record(model, tokens, duration_ms=int((time.perf_counter() - started) * 1000),
+                                  source=source, status=state)
+        recorded = True
+        if observer is not None:
+            observer(usage)
+        return usage
+
+    stream = factory()
+    try:
+        async for event in stream:
+            if isinstance(event, Done):
+                state = "completed" if event.is_complete else "incomplete"
+                event.usage_record = record(event.usage, state)
+                yield event
+                return
+            if isinstance(event, StreamError):
+                record(None, "failed")
+                yield event
+                return
+            yield event
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        try:
+            if not recorded:
+                record(None, status)
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
+
+def usage_token_text(summary: SessionUsageSummary, value: int) -> str:
+    missing = summary.usage_unavailable_calls
+    if missing and missing == summary.model_calls:
+        return f"未知（{missing} 次调用未提供 usage）"
+    return f">= {value:,}（{missing} 次未知）" if missing else f"{value:,}"
 
 
 def estimate_cost(tokens: TokenUsage, model: Model) -> tuple[str | None, str | None]:
@@ -152,7 +253,9 @@ def aggregate_usage_records(records: Iterable[ModelUsageRecord]) -> SessionUsage
     priced_calls = 0
     cache_observed_input = 0
     cache_metrics_calls = 0
+    sources: dict[str, int] = {}
     for record in rows:
+        sources[record.source] = sources.get(record.source, 0) + record.model_calls
         if record.estimated_cost_usd is not None:
             try:
                 known_cost += Decimal(record.estimated_cost_usd)
@@ -177,22 +280,35 @@ def aggregate_usage_records(records: Iterable[ModelUsageRecord]) -> SessionUsage
         cache_observed_input_tokens=cache_observed_input,
         cache_metrics_calls=cache_metrics_calls,
         cache_unavailable_calls=max(calls - cache_metrics_calls, 0),
+        usage_unavailable_calls=sum(record.model_calls for record in rows if not record.usage_available),
+        calls_by_source=sources,
     )
 
 
 def aggregate_session_usage(entries: Iterable[Any]) -> SessionUsageSummary:
     records: list[ModelUsageRecord] = []
+    seen: set[str] = set()
     for entry in entries:
-        if getattr(entry, "type", None) != "message":
-            continue
         data = getattr(entry, "data", {}) or {}
-        message = data.get("message") if isinstance(data, Mapping) else None
-        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+        if not isinstance(data, Mapping):
             continue
-        metadata = message.get("metadata")
-        usage = metadata.get("usage") if isinstance(metadata, Mapping) else None
+        if getattr(entry, "type", None) == "custom" and data.get("customType") == "model_usage":
+            usage = data.get("usage")
+        else:
+            if getattr(entry, "type", None) != "message":
+                continue
+            message = data.get("message")
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            usage = metadata.get("usage") if isinstance(metadata, Mapping) else None
         if isinstance(usage, Mapping):
-            records.append(ModelUsageRecord.from_dict(usage))
+            record = ModelUsageRecord.from_dict(usage)
+            if record.call_id and record.call_id in seen:
+                continue
+            if record.call_id:
+                seen.add(record.call_id)
+            records.append(record)
     return aggregate_usage_records(records)
 
 
@@ -286,7 +402,8 @@ def _decimal_string(value: Any) -> str | None:
     if value is None or value == "":
         return None
     try:
-        return _format_decimal(Decimal(str(value)))
+        parsed = Decimal(str(value))
+        return _format_decimal(parsed) if parsed.is_finite() and parsed >= 0 else None
     except (InvalidOperation, ValueError):
         return None
 

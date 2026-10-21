@@ -97,13 +97,18 @@ async def write_file(args: dict, context: ToolContext) -> ToolResult:
         stale_error = context.file_states.check_before_overwrite(path)
         if stale_error:
             return _file_state_guard_error(stale_error, path)
+    details = {"path": str(path), "line_count": _line_count(content), "char_count": len(content)}
+    if path.is_file() and path.read_bytes() == content.encode("utf-8"):
+        return tool_result(f"No changes: {path} already contains the requested content.", {
+            **details, "changed": False, "files_changed": 0, "changed_paths": [],
+        })
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     if context.file_states:
         context.file_states.note_write(path)
     return tool_result(
         f"Wrote {len(content)} characters to {path}",
-        {"path": str(path), "line_count": _line_count(content), "char_count": len(content)},
+        {**details, "changed": True, "files_changed": 1, "changed_paths": [str(path)]},
     )
 
 
@@ -154,10 +159,19 @@ async def edit_file(args: dict, context: ToolContext) -> ToolResult:
             tofile=str(path),
         )
     )
-    details = {"path": str(path), "dry_run": dry_run, **_diff_stats(diff)}
+    would_change = content != updated
+    details = {
+        "path": str(path), "dry_run": dry_run, "matches": count,
+        "changed": would_change and not dry_run, "would_change": would_change,
+        "files_changed": int(would_change and not dry_run),
+        "changed_paths": [str(path)] if would_change and not dry_run else [],
+        **_diff_stats(diff),
+    }
     preview = truncate_head_tail(diff, 8000)
     if dry_run:
         return tool_result(preview or "No changes.", details, full_content=diff if preview != diff else None)
+    if not would_change:
+        return tool_result(f"No changes: replacement leaves {path} unchanged.", details)
     path.write_text(updated, encoding="utf-8")
     if context.file_states:
         context.file_states.note_write(path)
@@ -197,16 +211,24 @@ async def apply_patch(args: dict, context: ToolContext) -> ToolResult:
         except PermissionError as exc:
             return fatal_tool_error(str(exc), code="workspace_policy_denied")
 
+    changed_paths = {path for path in after_by_path if before_by_path[path] != after_by_path[path]}
+    before_by_path = {path: before_by_path[path] for path in before_by_path if path in changed_paths}
+    after_by_path = {path: after_by_path[path] for path in after_by_path if path in changed_paths}
     diff = _multi_file_diff(before_by_path, after_by_path)
     details = {
         "dry_run": dry_run,
-        "files_changed": len(after_by_path),
+        "changed": bool(changed_paths) and not dry_run,
+        "would_change": bool(changed_paths),
+        "files_changed": len(changed_paths) if not dry_run else 0,
+        "changed_paths": [str(path) for path in after_by_path] if not dry_run else [],
         "operations": len(operations),
         **_diff_stats(diff),
     }
     preview = truncate_head_tail(diff, 12000)
     if dry_run:
         return tool_result(preview or "No changes.", details, full_content=diff if preview != diff else None)
+    if not changed_paths:
+        return tool_result("No changes: patch leaves all files unchanged.", details)
 
     error = _commit_patch(before_by_path, after_by_path)
     if error is not None:

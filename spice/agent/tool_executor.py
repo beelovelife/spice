@@ -10,7 +10,7 @@ from pathlib import Path
 
 from spice.agent.events import AgentEvent, ToolExecutionEndEvent, ToolExecutionStartEvent
 from spice.agent.logging_config import get_logger
-from spice.agent.tool_results import build_tool_result_metadata
+from spice.agent.tool_results import tool_result_message
 from spice.extensions.manager import ExtensionEvent, ExtensionManager
 from spice.llm.error_safety import public_exception_message
 from spice.llm.messages import Message, ToolCall
@@ -70,6 +70,7 @@ async def execute_tool_calls(
     max_concurrency: int,
     default_timeout_seconds: float,
     state: ToolExecutionState,
+    supports_vision: bool = False,
 ) -> AsyncIterator[AgentEvent]:
     prepared = await _preflight(calls, registry=registry, confirm=confirm, extensions=extensions)
     fatal_preflight = next(
@@ -97,6 +98,7 @@ async def execute_tool_calls(
         )
         if parallel:
             outcomes = []
+            completed: dict[int, ToolCallOutcome] = {}
             queue: asyncio.Queue[tuple[str, ToolExecutionStartEvent | ToolCallOutcome]] = asyncio.Queue()
             semaphore = asyncio.Semaphore(max(max_concurrency, 1))
             started_ids: set[str] = set()
@@ -115,7 +117,9 @@ async def execute_tool_calls(
                         file_states=file_states,
                         subagent_manager=subagent_manager,
                         default_timeout_seconds=default_timeout_seconds,
+                        supports_vision=supports_vision,
                     )
+                    completed[item.index] = outcome
                     await queue.put(("done", outcome))
 
             tasks = [asyncio.create_task(worker(item)) for item in batch]
@@ -161,6 +165,7 @@ async def execute_tool_calls(
                                 if item.call.id in completed_ids:
                                     continue
                                 skipped = _skipped_outcome(item)
+                                completed[item.index] = skipped
                                 if item.call.id not in started_ids:
                                     yield ToolExecutionStartEvent(item.call.id, item.call.name, item.call.arguments)
                                 yield ToolExecutionEndEvent(item.call.id, item.call.name, skipped.result)
@@ -173,8 +178,10 @@ async def execute_tool_calls(
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
-            outcomes.sort(key=lambda item: item.prepared.index)
-            await _persist_outcomes(outcomes, messages, model_messages, extensions)
+            finally:
+                # Workers record completion before queueing UI events. Cancellation
+                # must preserve even results the consumer has not received yet.
+                await _persist_outcomes(list(completed.values()), messages, model_messages, extensions)
         else:
             outcomes = []
             for item in batch:
@@ -189,10 +196,11 @@ async def execute_tool_calls(
                     file_states=file_states,
                     subagent_manager=subagent_manager,
                     default_timeout_seconds=default_timeout_seconds,
+                    supports_vision=supports_vision,
                 )
                 outcomes.append(outcome)
+                await _persist_outcomes([outcome], messages, model_messages, extensions)
                 yield ToolExecutionEndEvent(item.call.id, item.call.name, outcome.result)
-            await _persist_outcomes(outcomes, messages, model_messages, extensions)
 
         fatal = next((outcome for outcome in outcomes if outcome.result.disposition == "fatal"), None)
         if fatal is not None:
@@ -292,6 +300,7 @@ async def _execute_one(
     file_states: FileStateStore | None,
     subagent_manager,
     default_timeout_seconds: float,
+    supports_vision: bool,
 ) -> ToolCallOutcome:
     call = prepared.call
     started = time.perf_counter()
@@ -321,6 +330,7 @@ async def _execute_one(
                         confirm=confirm,
                         file_states=file_states,
                         subagent_manager=subagent_manager,
+                        supports_vision=supports_vision,
                     ),
                 )
         except TimeoutError:
@@ -364,11 +374,11 @@ async def _emit_and_persist(
     model_messages: list[Message],
     extensions: ExtensionManager | None,
 ) -> AsyncIterator[AgentEvent]:
+    await _persist_outcomes(outcomes, messages, model_messages, extensions)
     for outcome in outcomes:
         call = outcome.prepared.call
         yield ToolExecutionStartEvent(call.id, call.name, call.arguments)
         yield ToolExecutionEndEvent(call.id, call.name, outcome.result)
-    await _persist_outcomes(outcomes, messages, model_messages, extensions)
 
 
 async def _persist_outcomes(
@@ -377,22 +387,15 @@ async def _persist_outcomes(
     model_messages: list[Message],
     extensions: ExtensionManager | None,
 ) -> None:
-    for outcome in sorted(outcomes, key=lambda item: item.prepared.index):
-        call = outcome.prepared.call
-        result = outcome.result
-        metadata = build_tool_result_metadata(call.name, call.arguments, result)
-        if result.full_content is not None:
-            metadata["_full_tool_output"] = result.full_content
-        message = Message(
-            role="tool",
-            content=result.content,
-            tool_call_id=call.id,
-            name=call.name,
-            is_error=result.is_error,
-            metadata=metadata,
-        )
+    ordered = sorted(outcomes, key=lambda item: item.prepared.index)
+    for outcome in ordered:
+        message = tool_result_message(outcome.prepared.call, outcome.result)
         messages.append(message)
         model_messages.append(message)
+    # Record all completed results before awaiting any extension callback.
+    for outcome in ordered:
+        call = outcome.prepared.call
+        result = outcome.result
         if extensions:
             await extensions.emit(
                 "tool_call_end",

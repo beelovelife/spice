@@ -7,12 +7,13 @@ import pytest
 import spice.agent.agent_session as agent_session_module
 import spice.agent.memory as memory_module
 from spice.agent.agent_session import AgentSession
-from spice.agent.events import ToolExecutionEndEvent, TurnEndEvent
+from spice.agent.events import AssistantMessageEvent, ToolExecutionEndEvent, TurnEndEvent
 from spice.agent.memory import MemoryStore
 from spice.agent.sessions import SessionStore
 from spice.llm.config import SpiceConfig
-from spice.llm.messages import Message
-from spice.llm.types import TextDelta
+from spice.llm.messages import Message, ToolCall
+from spice.llm.models import Model
+from spice.llm.types import ModelRequestOptions, TextDelta
 from spice.storage.sqlite_memory import SqliteMemoryHistoryBackend
 from spice.tools.base import ToolContext, tool_result
 from spice.tools.memory import create_memory_tools
@@ -333,7 +334,7 @@ def test_memory_store_status_reports_distill_backlog_and_usage(tmp_path) -> None
 
 
 def test_memory_distiller_returns_empty_when_no_history(tmp_path) -> None:
-    distiller = memory_module.MemoryDistiller(MemoryStore(tmp_path / "memory"), model=object(), options=object())
+    distiller = memory_module.MemoryDistiller(MemoryStore(tmp_path / "memory"), model=Model(id="test", provider="test"), options=ModelRequestOptions())
 
     result = asyncio.run(distiller.run())
 
@@ -367,7 +368,7 @@ def test_memory_distiller_applies_model_plan_and_advances_cursor(tmp_path, monke
 
     monkeypatch.setattr(memory_module, "stream_model", fake_stream_model)
 
-    result = asyncio.run(memory_module.MemoryDistiller(store, model=object(), options=object()).run())
+    result = asyncio.run(memory_module.MemoryDistiller(store, model=Model(id="test", provider="test"), options=ModelRequestOptions()).run())
 
     assert result["success"] is True
     assert result["processed"] == 1
@@ -404,7 +405,7 @@ def test_memory_distiller_does_not_advance_cursor_when_plan_is_skipped(tmp_path,
 
     monkeypatch.setattr(memory_module, "stream_model", fake_stream_model)
 
-    result = asyncio.run(memory_module.MemoryDistiller(store, model=object(), options=object()).run())
+    result = asyncio.run(memory_module.MemoryDistiller(store, model=Model(id="test", provider="test"), options=ModelRequestOptions()).run())
 
     assert result["success"] is False
     assert result["skipped"] == 1
@@ -428,7 +429,7 @@ def test_memory_distiller_does_not_partially_apply_invalid_plan(tmp_path, monkey
 
     monkeypatch.setattr(memory_module, "stream_model", fake_stream_model)
 
-    result = asyncio.run(memory_module.MemoryDistiller(store, model=object(), options=object()).run())
+    result = asyncio.run(memory_module.MemoryDistiller(store, model=Model(id="test", provider="test"), options=ModelRequestOptions()).run())
 
     assert result["success"] is False
     assert store.read_entries("memory") == []
@@ -452,7 +453,7 @@ def test_memory_distiller_snapshot_writes_project_memory(tmp_path, monkeypatch) 
     monkeypatch.setattr(memory_module, "stream_model", fake_stream_model)
 
     result = asyncio.run(memory_module.MemoryDistiller(
-        store, model=object(), options=object(), allowed_targets={"project"}
+        store, model=Model(id="test", provider="test"), options=ModelRequestOptions(), allowed_targets={"project"}
     ).run_snapshot("The project test command is uv run pytest."))
 
     assert result["success"] is True
@@ -623,7 +624,11 @@ def test_agent_session_refreshes_memory_context_after_memory_tool_success(tmp_pa
     monkeypatch.setattr(agent_session_module, "load_config", lambda: SpiceConfig(memory_enabled=True))
 
     async def fake_run_turn(**_kwargs):
+        calls = [ToolCall("tc1", "memory", {})]
+        _kwargs["messages"].append(Message(role="assistant", tool_calls=calls))
+        yield AssistantMessageEvent(text="", tool_calls=calls)
         MemoryStore(memory_dir).add("user", "User prefers concise Chinese replies.")
+        _kwargs["messages"].append(Message(role="tool", tool_call_id="tc1", name="memory", content="ok"))
         yield ToolExecutionEndEvent(tool_call_id="tc1", tool_name="memory", result=tool_result("ok"))
         yield TurnEndEvent(text="done", stop_reason="stop")
 

@@ -1,14 +1,26 @@
 [project]
 name = "spice"
 version = "0.2.0"
-description = "Add your description here"
+description = "A local coding agent with CLI and TUI interfaces, multi-provider LLM support, controlled tools, and persistent sessions."
+readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
+keywords = ["agent", "coding-agent", "llm", "cli", "tui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+]
 dependencies = [
     "anthropic>=0.75.0",
     "google-genai>=1.55.0",
     "mcp>=1.27,<2",
     "openai>=2.14.0",
+    "pillow>=11.0",
     "prompt-toolkit>=3.0.52",
     "pydantic>=2.13.4",
     "pyright>=1.1.411",
@@ -23,6 +35,16 @@ dependencies = [
 [project.scripts]
 spice = "spice.cli.main:app"
 
+[project.urls]
+Homepage = "https://spiceagent.vercel.app/"
+Repository = "https://github.com/beelovelife/spice"
+Issues = "https://github.com/beelovelife/spice/issues"
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.50",
+]
+
 [tool.uv]
 package = true
 
@@ -34,7 +56,3 @@ dev = [
     "pytest>=9.0.3",
     "pytest-textual-snapshot>=1.0.0",
 ]
-
-[[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple/"
-default = true

@@ -19,6 +19,7 @@ from spice.llm.messages import Message
 from spice.llm.models import Model
 from spice.llm.stream import stream_model
 from spice.llm.types import ModelRequestOptions, StreamError, TextDelta
+from spice.llm.usage import track_model_stream
 
 DEFAULT_MEMORY_DIR = CONFIG_DIR / "memory"
 ENTRY_DELIMITER = "\n§\n"
@@ -594,7 +595,10 @@ class MemoryDistiller:
             Message(role="user", content=_distill_prompt(self.store, history, allowed_targets=self.allowed_targets)),
         ]
         parts: list[str] = []
-        async for event in stream_model(self.model, messages, [], self.options):
+        model, options = self.model, self.options
+        async for event in track_model_stream(
+            model, lambda: stream_model(model, messages, [], options), source="memory",
+        ):
             if isinstance(event, TextDelta):
                 parts.append(event.text)
             elif isinstance(event, StreamError):

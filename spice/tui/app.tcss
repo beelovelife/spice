@@ -1,0 +1,269 @@
+$background: #111827;
+$surface: #172033;
+$surface-alt: #202a40;
+$ink: #e5e7eb;
+$muted: #9ca8ba;
+$accent: #67e8f9;
+$success: #a7f3d0;
+$warning: #f4d99d;
+$danger: #fca5a5;
+$focus: #818cf8;
+
+Screen {
+    background: $background;
+    color: $ink;
+}
+
+#header {
+    height: 1;
+    padding: 0 2;
+    background: $surface-alt;
+    color: $accent;
+    text-style: bold;
+}
+
+#chat-scroll {
+    height: 1fr;
+    scrollbar-color: #475569;
+    scrollbar-background: $background;
+    padding: 1 2 0 2;
+}
+
+#messages {
+    width: 100%;
+    height: auto;
+}
+
+.message {
+    width: 100%;
+    height: auto;
+    min-height: 1;
+    margin: 0 0 1 0;
+    padding: 0 1;
+}
+
+.assistant-body {
+    width: 100%;
+    height: auto;
+}
+
+.user-message {
+    color: #f9fafb;
+}
+
+.reasoning-message {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    color: $muted;
+    background: #151d2d;
+}
+
+.reasoning-message:focus-within {
+    color: $ink;
+}
+
+.reasoning-body {
+    height: auto;
+    padding: 0 1 1 2;
+    color: #b8c2d3;
+}
+
+.tool-message {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    background: $surface;
+    color: $ink;
+}
+
+.tool-message.succeeded {
+    color: $success;
+}
+
+.tool-message.failed {
+    color: $danger;
+}
+
+.tool-args, .tool-output {
+    width: 100%;
+    height: auto;
+    padding: 0 1 1 2;
+    color: #cbd5e1;
+}
+
+.tool-output:empty, .tool-args:empty {
+    display: none;
+}
+
+.notice {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    color: $muted;
+}
+
+.notice-welcome {
+    width: auto;
+    max-width: 90%;
+    padding: 0 1;
+    border: round #475569;
+    color: $ink;
+}
+
+.notice-success {
+    color: $success;
+}
+
+.notice-warning {
+    color: $warning;
+}
+
+.notice-error {
+    color: $danger;
+}
+
+.command-view {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#activity-lane {
+    height: 1;
+    padding: 0 2;
+    background: $surface-alt;
+    color: $warning;
+}
+
+#queue-strip {
+    height: 1;
+    padding: 0 2;
+    background: #242b45;
+    color: #c7d2fe;
+}
+
+#command-suggestions {
+    width: 100%;
+    height: auto;
+    max-height: 8;
+    padding: 0 1;
+    background: $surface-alt;
+    color: $ink;
+}
+
+#command-suggestions > .option-list--option-highlighted {
+    background: #334155;
+    color: #f8fafc;
+    text-style: bold;
+}
+
+#composer {
+    width: 100%;
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    margin: 0;
+    padding: 0 1;
+    border: tall #334155;
+    background: #0f172a;
+    color: #f9fafb;
+}
+
+#composer:focus {
+    border: tall $focus;
+}
+
+#composer .text-area--placeholder {
+    color: #aeb8c8;
+}
+
+#status-bar {
+    height: 1;
+    padding: 0 2;
+    background: $surface-alt;
+    color: $muted;
+}
+
+ChoiceScreen, ApprovalScreen {
+    align: center middle;
+    background: rgba(3, 7, 18, 0.72);
+}
+
+.callback-dialog {
+    width: 72;
+    max-width: 94%;
+    height: auto;
+    max-height: 80%;
+    padding: 1 2;
+    background: $surface;
+    border: round #64748b;
+}
+
+.callback-title {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    color: #f9fafb;
+    text-style: bold;
+}
+
+.approval-preview {
+    width: 100%;
+    height: auto;
+    max-height: 10;
+    margin: 0 0 1 0;
+    padding: 1;
+    overflow-y: auto;
+    background: #0f172a;
+    color: #dbeafe;
+}
+
+#callback-options {
+    width: 100%;
+    height: auto;
+    max-height: 16;
+    background: $surface;
+}
+
+#callback-options > .option-list--option-highlighted {
+    background: #3730a3;
+    color: #ffffff;
+    text-style: bold;
+}
+
+.callback-help {
+    height: 1;
+    margin: 1 0 0 0;
+    color: $muted;
+}
+
+Screen.narrow #header {
+    padding: 0 1;
+}
+
+Screen.narrow #chat-scroll {
+    padding: 1 1 0 1;
+}
+
+Screen.narrow #status-bar {
+    padding: 0 1;
+}
+
+Screen.narrow .callback-dialog {
+    width: 100%;
+    max-width: 100%;
+    border: none;
+}
+
+Screen.short #header {
+    display: none;
+}
+
+Screen.short #composer {
+    min-height: 2;
+    max-height: 5;
+}

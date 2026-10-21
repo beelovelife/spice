@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from spice.sandbox.factory import create_environment, create_workspace_policy
+from spice.tools.verification import run_verified_command
 from spice.tools.base import Tool, ToolContext, ToolResult, fatal_tool_error, tool_error, tool_result, truncate_head_tail
 
 
@@ -17,7 +18,12 @@ async def bash(args: dict[str, Any], context: ToolContext) -> ToolResult:
         workspace = context.workspace or create_workspace_policy(None, cwd=context.cwd)
         environment = context.environment or create_environment(None, cwd=context.cwd)
         cwd = workspace.resolve_exec_cwd(str(args.get("cwd") or "."))
-        result = await environment.run(command, cwd=cwd, timeout=timeout)
+        if args.get("verification") is True:
+            result = await run_verified_command(
+                command, root=workspace.root, cwd=cwd, environment=environment, timeout=timeout,
+            )
+        else:
+            result = await environment.run(command, cwd=cwd, timeout=timeout)
     except (PermissionError, RuntimeError) as exc:
         return fatal_tool_error(str(exc), code="execution_policy_denied")
     if result.timed_out:
@@ -57,6 +63,10 @@ def create_bash_tools() -> list[Tool]:
                         "description": "Working directory relative to the current workspace. Defaults to '.'.",
                     },
                     "timeout": {"type": "number", "minimum": 1, "maximum": 600},
+                    "verification": {
+                        "type": "boolean",
+                        "description": "明确运行测试、构建或其他验收命令时设为 true，记录退出码与代码指纹；普通命令不算验证。",
+                    },
                 },
                 "required": ["command"],
                 "additionalProperties": False,

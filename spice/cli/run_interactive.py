@@ -15,6 +15,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 
 from spice.agent.agent_session import AgentSession
+from spice.agent.session_history import session_history
 from spice.cli.commands import (
     InteractiveCommandContext,
     SlashCommandRegistry,
@@ -381,6 +382,7 @@ async def run_conversation(
         console.print(f"[bold red]Error:[/bold red] {exc}")
         return
     console.print(f"[dim]Session: {agent_session.session_label}[/dim]")
+    _print_session_history(console, session_history(agent_session))
     trace_writer = None
     if trace:
         from spice.agent.trace import attach_trace_writer
@@ -428,7 +430,7 @@ async def run_conversation(
     while True:
         try:
             _sync_bottom_toolbar()
-            message = (await input_session.prompt_async("spice ❯ ")).strip()
+            message = (await input_session.prompt_async("> ")).strip()
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
@@ -492,12 +494,7 @@ async def run_conversation(
             if replacing_session:
                 console.print(f"[dim]Session: {agent_session.session_label}[/dim]")
             if result.replay_session_history:
-                history_messages = [
-                    message
-                    for message in agent_session.messages
-                    if message.role != "system"
-                ]
-                _print_session_history(console, history_messages)
+                _print_session_history(console, session_history(agent_session))
             if result.prompt:
                 await render_prompt_interruptible(
                     agent_session, renderer, result.prompt, console

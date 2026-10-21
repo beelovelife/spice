@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import pytest
 
 import spice.agent.compaction as compaction_module
 from spice.agent.compaction import (
     CompactionSettings,
+    CompactionPlan,
+    CompactionError,
+    generate_summary,
     check_compaction_needed,
     estimate_messages_tokens,
     prepare_compaction,
@@ -12,6 +17,7 @@ from spice.agent.compaction import (
 from spice.agent.sessions import SessionStore
 from spice.llm.messages import Message, ToolCall
 from spice.llm.models import Model
+from spice.llm.types import Done, ModelRequestOptions, TextDelta
 
 
 def test_should_compact_when_estimate_exceeds_context_minus_reserve() -> None:
@@ -119,3 +125,22 @@ def test_safe_json_fallback_remains_json() -> None:
     decoded = json.loads(encoded)
     assert "_unserializable" in decoded
     assert "{1, 2}" in decoded["_unserializable"]
+
+
+@pytest.mark.parametrize("finish", [None, "length", "stop"])
+def test_summary_requires_complete_model_response(monkeypatch, finish):
+    async def stream(*_args):
+        yield TextDelta("a partial summary looks plausible")
+        if finish:
+            yield Done(finish)
+
+    monkeypatch.setattr(compaction_module, "stream_model", stream)
+    request = generate_summary(
+        plan=CompactionPlan("kept", [Message(role="user", content="old")], [], None, 10),
+        model=Model(id="fake", provider="fake"), options=ModelRequestOptions(),
+    )
+    if finish == "stop":
+        assert asyncio.run(request) == "a partial summary looks plausible"
+    else:
+        with pytest.raises(CompactionError):
+            asyncio.run(request)

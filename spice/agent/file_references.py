@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from spice.llm.models import Model
+from spice.llm.images import MAX_PROMPT_IMAGES, load_image
+from spice.llm.messages import ImageContent
 
 REFERENCE_HEADER = "Referenced files:"
 SINGLE_FILE_CHAR_LIMIT = 12_000
@@ -66,6 +68,7 @@ class FileReferenceExpansion:
     references: list[FileReference] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     expanded: bool = False
+    images: list[ImageContent] = field(default_factory=list)
 
 
 class FileReferenceError(Exception):
@@ -83,6 +86,7 @@ def expand_file_references(text: str, *, cwd: Path, model: Model) -> FileReferen
     used_chars = 0
     blocks: list[str] = []
     warnings: list[str] = []
+    images: list[ImageContent] = []
     seen: set[tuple[str, str, int | None, int | None]] = set()
 
     for reference in references:
@@ -104,6 +108,7 @@ def expand_file_references(text: str, *, cwd: Path, model: Model) -> FileReferen
             cwd=cwd,
             model=model,
             remaining_chars=max(total_limit - used_chars, 0),
+            images=images,
         )
         if warning:
             warnings.append(warning)
@@ -124,7 +129,7 @@ def expand_file_references(text: str, *, cwd: Path, model: Model) -> FileReferen
         final += "\n\nReference warnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
     if blocks:
         final += f"\n\n{REFERENCE_HEADER}\n\n" + "\n\n".join(blocks)
-    return FileReferenceExpansion(message=final, references=references, warnings=warnings, expanded=True)
+    return FileReferenceExpansion(message=final, references=references, warnings=warnings, expanded=True, images=images)
 
 
 def parse_file_references(text: str) -> list[FileReference]:
@@ -254,6 +259,7 @@ def _expand_resolved_reference(
     cwd: Path,
     model: Model,
     remaining_chars: int,
+    images: list[ImageContent],
 ) -> tuple[str | None, str | None, int]:
     path = resolved.path
     try:
@@ -277,7 +283,18 @@ def _expand_resolved_reference(
             raise FileReferenceError(
                 f"Image file detected: {_display_path(path, cwd)}. Current model does not support image input."
             )
-        return None, _metadata_block(path, cwd, mime_type, "Image attachment support is not enabled yet.", injected=False), 0
+        if len(images) >= MAX_PROMPT_IMAGES:
+            return f"{reference.raw}: at most {MAX_PROMPT_IMAGES} image attachments are allowed per prompt", None, 0
+        try:
+            image = load_image(path)
+        except (OSError, ValueError) as exc:
+            return f"{reference.raw}: {exc}", None, 0
+        estimated_chars = 4 * (256 + 2 * ((image.width + 31) // 32) * ((image.height + 31) // 32))
+        if estimated_chars > remaining_chars:
+            return f"{reference.raw}: image exceeds the file reference context budget", None, 0
+        images.append(image)
+        body = f"Image attached ({image.width}x{image.height}); animated images use the first frame."
+        return None, _metadata_block(path, cwd, image.media_type, body, injected=True), estimated_chars
 
     if _is_binary(path):
         size = _human_size(path)
