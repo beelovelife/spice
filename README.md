@@ -433,14 +433,6 @@ uv run spice --debug
 - 不冻结实现细节，避免大段 mock。
 - TUI / CLI 共享逻辑应同时被两端的测试覆盖。
 
----
-
-## 🔗 友链
-
-[LINUX DO - 新的理想型社区](https://linux.do/)
-
----
-
 ## 📄 许可证
 
 本项目基于 [Apache License 2.0](LICENSE) 开源。
